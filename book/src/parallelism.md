@@ -14,6 +14,10 @@ processes or threads, they typically spend some time waiting for straggler tasks
 Running one or more build or test tasks in parallel can use up this otherwise wasted capacity.
 This can give significant performance improvements, depending on the tree under test and the hardware resources available.
 
+## With mutant schemata
+
+With [mutant schemata](schemata.md), the default, embedded mutants all share one build, and `--jobs` sets how many of them are tested at once. Without `--jobs`, cargo-mutants measures how many copies of the tests can usefully run at once, and uses that. Mutants that can't be embedded are then built and tested separately by `--jobs` workers, one by default, as described below.
+
 ## Timeouts
 
 Because tests may be slower with high parallelism, or may exhibit more variability in execution time, you may see some spurious timeouts, and you may need to set `--timeout` manually to allow enough safety margin. (User feedback on this is welcome.)
@@ -37,6 +41,10 @@ behavior under high load. Ultimately you'll need to experiment to find the best 
 To tune the number of jobs, you can watch `htop` or some similar program while the tests are running, to see whether cores are fully utilized or whether the system is running out of memory. On laptop or desktop machines you might also want to watch the temperature of the CPU.
 
 As well as using more CPU and RAM, higher `-j` settings will also use more disk space in your temporary directory: Rust `target` directories can commonly be 2GB or more, and there will be one per parallel job, plus whatever temp files your test suite might create.
+
+## Build directories for parallel jobs
+
+Each job has its own build directory. After the baseline passes, the extra build directories are seeded with a copy of the baseline's `target/` directory, so that they don't need to build all your dependencies from scratch. This is on by default; see [seeding build directories](build-dirs.md#seeding-build-directories-from-the-baseline) for details and how to turn it off.
 
 ## Interaction with `--test-threads`
 

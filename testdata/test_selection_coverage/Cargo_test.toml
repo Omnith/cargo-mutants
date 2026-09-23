@@ -1,0 +1,18 @@
+# A tree for `cargo mutants --schemata --test-selection=coverage`, which runs only
+# the tests that execute each mutant's code, to check that it gives the same
+# outcome as running all the tests.
+#
+# It has a function no test executes (reported missed without running tests), a
+# weakly tested function (its selected tests pass, and running all tests confirms
+# it's missed), a function executed by a fast and a slow test, and a binary that
+# only an integration test runs, as a child process. It has no doctests, which
+# aren't instrumented for coverage.
+
+[package]
+name = "cargo-mutants-testdata-test-selection-coverage"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+doctest = false

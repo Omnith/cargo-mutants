@@ -1,0 +1,10 @@
+# A package whose integration test reads its crate root.
+
+[package]
+name = "cargo-mutants-testdata-schemata-root-reader"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+doctest = false

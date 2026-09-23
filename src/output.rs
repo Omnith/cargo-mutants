@@ -4,18 +4,19 @@
 
 use std::collections::{HashMap, hash_map::Entry};
 use std::fs::{File, OpenOptions, create_dir, read_to_string, remove_dir_all, rename, write};
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, ErrorKind, Write};
 use std::path::Path;
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use camino::{Utf8Path, Utf8PathBuf};
 use fs4::fs_std::FileExt;
 use jiff::Timestamp;
 use path_slash::PathExt;
 use serde::Serialize;
-use tracing::{info, trace};
+use tracing::{debug, error, info, trace, warn};
 
+use crate::fail_fast::Rerun;
 use crate::outcome::{LabOutcome, SummaryOutcome};
 use crate::{Context, Mutant, Result, Scenario, ScenarioOutcome, check_interrupted};
 
@@ -23,7 +24,23 @@ const OUTDIR_NAME: &str = "mutants.out";
 const ROTATED_NAME: &str = "mutants.out.old";
 const LOCK_JSON: &str = "lock.json";
 const LOCK_POLL: Duration = Duration::from_millis(100);
+const OUTCOMES_JSON: &str = "outcomes.json";
+/// Minimum time between rewrites of `outcomes.json` while mutants are being tested.
+///
+/// Every rewrite serializes all outcomes so far, under the lock shared by all workers, so
+/// rewriting after every mutant costs O(n^2): about 7 seconds in total for 2000 mutants.
+/// One second keeps that overhead to a few milliseconds per second of run time, while
+/// the file still lags the run by less than the time taken to test a typical mutant.
+/// The baseline outcome and the final (or interrupted) state are always written promptly.
+const OUTCOMES_JSON_WRITE_INTERVAL: Duration = Duration::from_secs(1);
+/// How many times to retry replacing a JSON file while another process holds it open.
+///
+/// With the linearly increasing delay below, this waits at most 0.3 s in total.
+const PERSIST_RETRIES: u32 = 5;
+const PERSIST_RETRY_DELAY: Duration = Duration::from_millis(20);
 static CAUGHT_TXT: &str = "caught.txt";
+static MISSED_TXT: &str = "missed.txt";
+static TIMEOUT_TXT: &str = "timeout.txt";
 static PREVIOUSLY_CAUGHT_TXT: &str = "previously_caught.txt";
 static UNVIABLE_TXT: &str = "unviable.txt";
 
@@ -88,18 +105,25 @@ pub struct OutputDir {
 
     #[allow(unused)] // Lifetime controls the file lock
     lock_file: File,
-    /// A file holding a list of missed mutants as text, one per line.
-    missed_list: File,
-    /// A file holding a list of caught mutants as text, one per line.
-    caught_list: File,
-    /// A file holding a list of mutants where testing timed out, as text, one per line.
-    timeout_list: File,
-    unviable_list: File,
+    /// Lists of missed, caught, timed out, and unviable mutants, as text, one per line.
+    missed_list: OutcomeList,
+    caught_list: OutcomeList,
+    timeout_list: OutcomeList,
+    unviable_list: OutcomeList,
+    /// The position of each mutant's name in the order they were discovered, in which
+    /// the lists are sorted when the run ends.
+    discovery_order: HashMap<String, usize>,
     /// The accumulated overall lab outcome.
     pub lab_outcome: LabOutcome,
     /// Log filenames which have already been used, and the number of times that each
     /// basename has been used.
     used_log_names: HashMap<String, usize>,
+    /// When `outcomes.json` was last written, if ever.
+    outcomes_json_written_at: Option<Instant>,
+    /// True if `lab_outcome` has changed since `outcomes.json` was last written.
+    outcomes_json_stale: bool,
+    /// How to rerun a mutant whose tests are stopped early, for its log.
+    rerun: Rerun,
 }
 
 impl OutputDir {
@@ -141,30 +165,19 @@ impl OutputDir {
         let diff_dir = output_dir.join("diff");
         create_dir(diff_dir).context("create diff dir")?;
 
-        // Create text list files.
-        let mut list_file_options = OpenOptions::new();
-        list_file_options.create(true).append(true);
-        let missed_list = list_file_options
-            .open(output_dir.join("missed.txt"))
-            .context("create missed.txt")?;
-        let caught_list = list_file_options
-            .open(output_dir.join(CAUGHT_TXT))
-            .context("create caught.txt")?;
-        let unviable_list = list_file_options
-            .open(output_dir.join(UNVIABLE_TXT))
-            .context("create unviable.txt")?;
-        let timeout_list = list_file_options
-            .open(output_dir.join("timeout.txt"))
-            .context("create timeout.txt")?;
         Ok(OutputDir {
+            missed_list: OutcomeList::create(&output_dir, MISSED_TXT)?,
+            caught_list: OutcomeList::create(&output_dir, CAUGHT_TXT)?,
+            timeout_list: OutcomeList::create(&output_dir, TIMEOUT_TXT)?,
+            unviable_list: OutcomeList::create(&output_dir, UNVIABLE_TXT)?,
+            discovery_order: HashMap::new(),
             path: output_dir,
             lab_outcome: LabOutcome::new(Timestamp::now()),
             lock_file,
-            missed_list,
-            caught_list,
-            timeout_list,
-            unviable_list,
             used_log_names: HashMap::new(),
+            outcomes_json_written_at: None,
+            outcomes_json_stale: false,
+            rerun: Rerun::default(),
         })
     }
 
@@ -174,18 +187,59 @@ impl OutputDir {
             Scenario::Baseline => "baseline".into(),
             Scenario::Mutant(mutant) => mutant.log_file_name_base(),
         };
-        let basename = match self.used_log_names.entry(scenario_name.clone()) {
+        let basename = self.unique_log_basename(scenario_name);
+        let mut scenario_output = ScenarioOutput::new(&self.path, scenario, &basename)?;
+        scenario_output.rerun_command = scenario.mutant().map(|m| self.rerun.command(m));
+        Ok(scenario_output)
+    }
+
+    /// Remember the order in which `mutants` were discovered, in which the lists of
+    /// mutants by outcome are finally written.
+    pub fn set_discovery_order(&mut self, mutants: &[Mutant]) {
+        self.discovery_order.clear();
+        for (i, mutant) in mutants.iter().enumerate() {
+            self.discovery_order.entry(mutant.name(true)).or_insert(i);
+        }
+    }
+
+    /// Rewrite the lists of mutants by outcome in the order the mutants were discovered,
+    /// rather than the order in which they finished.
+    fn sort_outcome_lists(&mut self) -> Result<()> {
+        for list in [
+            &mut self.missed_list,
+            &mut self.caught_list,
+            &mut self.timeout_list,
+            &mut self.unviable_list,
+        ] {
+            list.sort(&self.discovery_order)?;
+        }
+        Ok(())
+    }
+
+    /// Say how to rerun a mutant whose tests are stopped early, in its log.
+    pub fn set_rerun(&mut self, rerun: Rerun) {
+        self.rerun = rerun;
+    }
+
+    /// Open a log for a step that is not a scenario, such as a schemata check pass.
+    pub fn start_log(&mut self, name: &str) -> Result<ScenarioOutput> {
+        let basename = self.unique_log_basename(name.to_owned());
+        ScenarioOutput::open(&self.path, &basename, None, name)
+    }
+
+    /// Return `name`, or if it's already been used, `name` with a unique suffix.
+    fn unique_log_basename(&mut self, name: String) -> String {
+        match self.used_log_names.entry(name.clone()) {
             Entry::Occupied(mut e) => {
                 let index = e.get_mut();
                 *index += 1;
-                format!("{scenario_name}_{index:03}")
+                format!("{name}_{index:03}")
             }
             Entry::Vacant(e) => {
                 e.insert(0);
-                scenario_name
+                name
             }
-        };
-        ScenarioOutput::new(&self.path, scenario, &basename)
+        }
     }
 
     /// Return the path of the `mutants.out` directory.
@@ -197,28 +251,47 @@ impl OutputDir {
     /// Write `outcomes.json` from the current in-memory state.
     ///
     /// Called multiple times as the lab runs, and once at the end.
-    fn write_lab_outcome(&self) -> Result<()> {
-        serde_json::to_writer_pretty(
-            BufWriter::new(File::create(self.path.join("outcomes.json"))?),
-            &self.lab_outcome,
-        )
-        .context("write outcomes.json")
+    fn write_lab_outcome(&mut self) -> Result<()> {
+        let start = Instant::now();
+        replace_json_file(&self.path, OUTCOMES_JSON, &self.lab_outcome)?;
+        self.outcomes_json_written_at = Some(Instant::now());
+        self.outcomes_json_stale = false;
+        debug!(
+            n_outcomes = self.lab_outcome.outcomes.len(),
+            elapsed = ?start.elapsed(),
+            "wrote outcomes.json"
+        );
+        Ok(())
     }
 
     /// Add the result of testing one scenario.
+    ///
+    /// `outcomes.json` is rewritten at most once per [`OUTCOMES_JSON_WRITE_INTERVAL`], except
+    /// that the baseline outcome is written immediately. Any outcomes not yet written are
+    /// written by [`OutputDir::finish`], or when the `OutputDir` is dropped.
     pub fn add_scenario_outcome(&mut self, scenario_outcome: &ScenarioOutcome) -> Result<()> {
         self.lab_outcome.add(scenario_outcome.to_owned());
-        self.write_lab_outcome()?;
+        self.outcomes_json_stale = true;
+        let due = self
+            .outcomes_json_written_at
+            .is_none_or(|t| t.elapsed() >= OUTCOMES_JSON_WRITE_INTERVAL);
+        if (due || !scenario_outcome.scenario.is_mutant())
+            && let Err(err) = self.write_lab_outcome()
+        {
+            // The outcomes stay marked as unwritten, so a later write or `finish` retries;
+            // only a failure to write the final state is an error.
+            warn!("Failed to update outcomes.json, will retry: {err:#}");
+        }
         let scenario = &scenario_outcome.scenario;
         if let Scenario::Mutant(mutant) = scenario {
-            let file = match scenario_outcome.summary() {
+            let list = match scenario_outcome.summary() {
                 SummaryOutcome::MissedMutant => &mut self.missed_list,
                 SummaryOutcome::CaughtMutant => &mut self.caught_list,
                 SummaryOutcome::Timeout => &mut self.timeout_list,
                 SummaryOutcome::Unviable => &mut self.unviable_list,
                 _ => return Ok(()),
             };
-            writeln!(file, "{}", mutant.name(true)).context("write to list file")?;
+            list.add(mutant.name(true))?;
         }
         Ok(())
     }
@@ -246,7 +319,13 @@ impl OutputDir {
         // higher level "accumulator" object?
         self.lab_outcome.end_time = Some(Timestamp::now());
         self.write_lab_outcome()?;
-        Ok(self.lab_outcome)
+        self.sort_outcome_lists()?;
+        // Can't move out of a type that implements Drop, so leave an empty outcome behind.
+        // It's not stale, so it won't be written.
+        Ok(std::mem::replace(
+            &mut self.lab_outcome,
+            LabOutcome::new(Timestamp::now()),
+        ))
     }
 
     pub fn write_previously_caught(&self, caught: &[String]) -> Result<()> {
@@ -263,6 +342,126 @@ impl OutputDir {
             .and_then(|mut f| f.write_all(b.as_bytes()))
             .with_context(|| format!("Write {path:?}"))
     }
+}
+
+impl Drop for OutputDir {
+    /// Write any outcomes not yet in `outcomes.json`, and sort the lists of mutants.
+    ///
+    /// This happens when the run is interrupted or fails, and so `finish` is not called.
+    fn drop(&mut self) {
+        if self.outcomes_json_stale
+            && let Err(err) = self.write_lab_outcome()
+        {
+            error!("Failed to write outcomes.json: {err:#}");
+        }
+        if let Err(err) = self.sort_outcome_lists() {
+            error!("Failed to sort lists of mutants: {err:#}");
+        }
+    }
+}
+
+/// A text file listing the mutants with one outcome, one per line.
+///
+/// Names are appended as mutants finish, so that other programs can follow progress,
+/// and the list is rewritten in the order the mutants were discovered when the run
+/// ends, so that it doesn't depend on which mutants finished first.
+#[derive(Debug)]
+struct OutcomeList {
+    file: File,
+    file_name: &'static str,
+    names: Vec<String>,
+    /// True if names were added since the list was last sorted.
+    unsorted: bool,
+}
+
+impl OutcomeList {
+    fn create(output_dir: &Utf8Path, file_name: &'static str) -> Result<OutcomeList> {
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(output_dir.join(file_name))
+            .with_context(|| format!("create {file_name}"))?;
+        Ok(OutcomeList {
+            file,
+            file_name,
+            names: Vec::new(),
+            unsorted: false,
+        })
+    }
+
+    fn add(&mut self, name: String) -> Result<()> {
+        writeln!(self.file, "{name}").with_context(|| format!("write to {}", self.file_name))?;
+        self.names.push(name);
+        self.unsorted = true;
+        Ok(())
+    }
+
+    /// Rewrite the list with names in the order of their position in `discovery_order`,
+    /// followed by any names not in it, in the order they were added.
+    fn sort(&mut self, discovery_order: &HashMap<String, usize>) -> Result<()> {
+        if !self.unsorted {
+            return Ok(());
+        }
+        self.names
+            .sort_by_key(|name| discovery_order.get(name).copied().unwrap_or(usize::MAX));
+        let mut text = String::with_capacity(self.names.iter().map(|name| name.len() + 1).sum());
+        for name in &self.names {
+            text.push_str(name);
+            text.push('\n');
+        }
+        // The file is opened for appending, so after truncating it, this writes from the
+        // start. Rewriting in place, rather than replacing the file, works on Windows
+        // while the file is open.
+        self.file
+            .set_len(0)
+            .and_then(|()| self.file.write_all(text.as_bytes()))
+            .with_context(|| format!("rewrite {}", self.file_name))?;
+        self.unsorted = false;
+        Ok(())
+    }
+}
+
+/// Write `value` as pretty JSON to the file `name` in `dir`, atomically replacing any
+/// existing file, so that readers only ever see a complete file.
+pub fn replace_json_file(dir: &Utf8Path, name: &str, value: &impl Serialize) -> Result<()> {
+    let mut builder = tempfile::Builder::new();
+    let prefix = format!(".{name}.");
+    builder.prefix(&prefix).suffix(".tmp");
+    // Same mode as `File::create`, which is then reduced by the umask, rather than
+    // tempfile's default of 0o600.
+    #[cfg(unix)]
+    builder.permissions(std::os::unix::fs::PermissionsExt::from_mode(0o666));
+    let mut temp = builder
+        .tempfile_in(dir)
+        .with_context(|| format!("create temporary {name}"))?;
+    let mut writer = BufWriter::new(&mut temp);
+    serde_json::to_writer_pretty(&mut writer, value).with_context(|| format!("write {name}"))?;
+    writer.flush().with_context(|| format!("write {name}"))?;
+    drop(writer);
+    let path = dir.join(name);
+    let mut retries = 0;
+    while let Err(err) = temp.persist(&path) {
+        if !replace_may_succeed_later(&err.error) || retries == PERSIST_RETRIES {
+            return Err(err.error).with_context(|| format!("replace {name}"));
+        }
+        retries += 1;
+        debug!(retries, error = %err.error, "{name} is busy, retrying");
+        temp = err.file;
+        sleep(PERSIST_RETRY_DELAY * retries);
+    }
+    Ok(())
+}
+
+/// True if replacing a file failed in a way that retrying might fix.
+///
+/// On Windows the rename is refused while another process has the old file open
+/// without delete sharing, as many readers do, with either "access denied" or a
+/// sharing violation.
+fn replace_may_succeed_later(err: &std::io::Error) -> bool {
+    /// Windows' `ERROR_SHARING_VIOLATION`.
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    err.kind() == ErrorKind::PermissionDenied
+        || (cfg!(windows) && err.raw_os_error() == Some(ERROR_SHARING_VIOLATION))
 }
 
 /// Return the string names of mutants previously caught in this output directory, including
@@ -294,28 +493,41 @@ pub struct ScenarioOutput {
     pub log_file: File,
     /// File holding the diff of the mutated file, only if it's a mutation.
     pub diff_path: Option<Utf8PathBuf>,
+    /// For a mutant, a command that tests only it, without stopping its tests early.
+    pub rerun_command: Option<String>,
 }
 
 impl ScenarioOutput {
     fn new(output_dir: &Utf8Path, scenario: &Scenario, basename: &str) -> Result<Self> {
+        let diff_path = if scenario.is_mutant() {
+            Some(Utf8PathBuf::from(format!("diff/{basename}.diff")))
+        } else {
+            None
+        };
+        ScenarioOutput::open(output_dir, basename, diff_path, &scenario.to_string())
+    }
+
+    /// Create the log file, starting with a header message.
+    fn open(
+        output_dir: &Utf8Path,
+        basename: &str,
+        diff_path: Option<Utf8PathBuf>,
+        header: &str,
+    ) -> Result<Self> {
         let log_path = Utf8PathBuf::from(format!("log/{basename}.log"));
         let log_file = File::options()
             .append(true)
             .create_new(true)
             .read(true)
             .open(output_dir.join(&log_path))?;
-        let diff_path = if scenario.is_mutant() {
-            Some(Utf8PathBuf::from(format!("diff/{basename}.diff")))
-        } else {
-            None
-        };
         let mut scenario_output = Self {
             output_dir: output_dir.to_owned(),
             log_path,
             log_file,
             diff_path,
+            rerun_command: None,
         };
-        scenario_output.message(&scenario.to_string())?;
+        scenario_output.message(header)?;
         Ok(scenario_output)
     }
 
@@ -375,6 +587,21 @@ mod test {
 
     use super::*;
     use crate::workspace::Workspace;
+
+    #[test]
+    fn replace_may_succeed_later_for_permission_denied_or_windows_sharing_violation() {
+        assert!(replace_may_succeed_later(&std::io::Error::from(
+            ErrorKind::PermissionDenied
+        )));
+        assert!(!replace_may_succeed_later(&std::io::Error::from(
+            ErrorKind::NotFound
+        )));
+        // 32 is ERROR_SHARING_VIOLATION on Windows, and something else elsewhere.
+        assert_eq!(
+            replace_may_succeed_later(&std::io::Error::from_raw_os_error(32)),
+            cfg!(windows)
+        );
+    }
 
     fn minimal_source_tree() -> TempDir {
         let tmp = tempdir().unwrap();
@@ -539,5 +766,243 @@ src/process.rs:248:5: replace get_command_output -> Result<String> with Ok(Strin
         assert!(parent.join("mutants.out/previously_caught.txt").is_file());
         let now = load_previously_caught(parent).expect("load succeeds");
         assert_eq!(now.iter().collect_vec(), example.lines().collect_vec());
+    }
+
+    fn read_outcomes_json(output_dir: &Utf8Path) -> serde_json::Value {
+        let json = read_to_string(output_dir.join("outcomes.json")).expect("read outcomes.json");
+        serde_json::from_str(&json).expect("parse outcomes.json")
+    }
+
+    fn some_mutants() -> Vec<Mutant> {
+        crate::visit::mutate_source_str(include_str!("outcome.rs"), &crate::Options::default())
+            .unwrap()
+    }
+
+    fn baseline_outcome(output_dir: &mut OutputDir) -> ScenarioOutcome {
+        use crate::outcome::{Phase, PhaseResult};
+        use crate::process::Exit;
+        let scenario_output = output_dir.start_scenario(&Scenario::Baseline).unwrap();
+        let mut outcome = ScenarioOutcome::new(&scenario_output, Scenario::Baseline);
+        outcome.add_phase_result(PhaseResult {
+            phase: Phase::Test,
+            duration: Duration::from_secs(1),
+            process_status: Exit::Success,
+            argv: vec!["cargo".into(), "test".into()],
+        });
+        outcome
+    }
+
+    #[test]
+    fn add_scenario_outcome_writes_baseline_to_outcomes_json_immediately() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut output_dir = OutputDir::new(temp_dir.path().try_into().unwrap()).unwrap();
+        let mutants = some_mutants();
+        // A mutant outcome first, so that the baseline is not the first write.
+        let mutant_outcome = realistic_mutant_outcome(&mut output_dir, mutants[0].clone());
+        output_dir.add_scenario_outcome(&mutant_outcome).unwrap();
+        let baseline = baseline_outcome(&mut output_dir);
+        output_dir.add_scenario_outcome(&baseline).unwrap();
+
+        let json = read_outcomes_json(output_dir.path());
+        assert_eq!(json["outcomes"].as_array().unwrap().len(), 2);
+        assert_eq!(json["outcomes"][1]["scenario"], "Baseline");
+    }
+
+    /// Interrupted or failed runs drop the `OutputDir` without calling `finish`: all the
+    /// outcomes recorded so far must still reach `outcomes.json`.
+    #[test]
+    fn dropping_output_dir_writes_all_outcomes_to_outcomes_json() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut output_dir = OutputDir::new(temp_dir.path().try_into().unwrap()).unwrap();
+        let path = output_dir.path().to_owned();
+        let baseline = baseline_outcome(&mut output_dir);
+        output_dir.add_scenario_outcome(&baseline).unwrap();
+        let mutants = some_mutants();
+        for mutant in &mutants {
+            let outcome = realistic_mutant_outcome(&mut output_dir, mutant.clone());
+            output_dir.add_scenario_outcome(&outcome).unwrap();
+        }
+        drop(output_dir);
+
+        let json = read_outcomes_json(&path);
+        assert_eq!(
+            json["outcomes"].as_array().unwrap().len(),
+            mutants.len() + 1
+        );
+        assert_eq!(json["total_mutants"], mutants.len());
+        assert_eq!(json["caught"], mutants.len());
+        assert_eq!(json["end_time"], serde_json::Value::Null);
+    }
+
+    /// A reader polling `outcomes.json` while it is rewritten always sees a complete file,
+    /// and no temporary files are left behind.
+    #[test]
+    fn write_lab_outcome_never_exposes_partial_outcomes_json() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::thread;
+
+        let temp_dir = TempDir::new().unwrap();
+        let mut output_dir = OutputDir::new(temp_dir.path().try_into().unwrap()).unwrap();
+        // Make the file big enough that writing it takes a while.
+        for mutant in some_mutants().into_iter().cycle().take(500) {
+            let outcome = realistic_mutant_outcome(&mut output_dir, mutant);
+            output_dir.lab_outcome.add(outcome);
+        }
+        output_dir.write_lab_outcome().unwrap();
+        let json_path = output_dir.path().join("outcomes.json");
+        let done = AtomicBool::new(false);
+        let n_reads = thread::scope(|scope| {
+            let reader = scope.spawn(|| {
+                let mut n_reads = 0;
+                while !done.load(Ordering::Relaxed) {
+                    let json = read_to_string(&json_path).expect("outcomes.json always exists");
+                    serde_json::from_str::<serde_json::Value>(&json)
+                        .expect("outcomes.json is always complete");
+                    n_reads += 1;
+                }
+                n_reads
+            });
+            for _ in 0..20 {
+                output_dir.write_lab_outcome().unwrap();
+            }
+            done.store(true, Ordering::Relaxed);
+            reader.join().unwrap()
+        });
+        assert!(n_reads > 0);
+
+        let mut names = std::fs::read_dir(output_dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("outcomes"))
+            .collect_vec();
+        names.sort();
+        assert_eq!(names, ["outcomes.json"]);
+    }
+
+    /// `outcomes.json` is created with the same mode as other output files, so an atomic
+    /// replace doesn't make it private to the user (or world-writable).
+    #[cfg(unix)]
+    #[test]
+    fn outcomes_json_permissions_match_other_output_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = TempDir::new().unwrap();
+        let mut output_dir = OutputDir::new(temp_dir.path().try_into().unwrap()).unwrap();
+        let path = output_dir.path().to_owned();
+        let baseline = baseline_outcome(&mut output_dir);
+        output_dir.add_scenario_outcome(&baseline).unwrap();
+
+        let mode = |name: &str| path.join(name).metadata().unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode("outcomes.json"), mode("missed.txt"));
+    }
+
+    /// Mutants finish in whatever order concurrent workers test them, but the lists of
+    /// mutants by outcome end up in the order the mutants were discovered, both when the
+    /// run finishes and when it's interrupted.
+    #[test]
+    fn set_discovery_order_sorts_caught_txt_whatever_order_mutants_finish() {
+        let mutants = some_mutants();
+        assert!(mutants.len() > 2);
+        let expected = mutants.iter().map(|m| m.name(true) + "\n").join("");
+        for finish in [true, false] {
+            let temp_dir = TempDir::new().unwrap();
+            let mut output_dir = OutputDir::new(temp_dir.path().try_into().unwrap()).unwrap();
+            let path = output_dir.path().to_owned();
+            output_dir.set_discovery_order(&mutants);
+            for mutant in mutants.iter().rev() {
+                let outcome = realistic_mutant_outcome(&mut output_dir, mutant.clone());
+                output_dir.add_scenario_outcome(&outcome).unwrap();
+            }
+            if finish {
+                output_dir.finish().unwrap();
+            } else {
+                drop(output_dir);
+            }
+            assert_eq!(
+                read_to_string(path.join(CAUGHT_TXT)).unwrap(),
+                expected,
+                "finish={finish}"
+            );
+        }
+    }
+
+    /// Build a realistic outcome for a mutant: a successful build followed by a failing test.
+    fn realistic_mutant_outcome(output_dir: &mut OutputDir, mutant: Mutant) -> ScenarioOutcome {
+        use crate::outcome::{Phase, PhaseResult};
+        use crate::process::Exit;
+        let scenario = Scenario::Mutant(mutant);
+        let scenario_output = output_dir.start_scenario(&scenario).unwrap();
+        let mut outcome = ScenarioOutcome::new(&scenario_output, scenario);
+        let argv = |phase: &str| {
+            [
+                "/home/user/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+                phase,
+                "--verbose",
+                "--package=cargo-mutants-testdata-internal@0.0.0",
+                "--no-fail-fast",
+            ]
+            .map(str::to_owned)
+            .to_vec()
+        };
+        outcome.add_phase_result(PhaseResult {
+            phase: Phase::Build,
+            duration: Duration::from_millis(1234),
+            process_status: Exit::Success,
+            argv: argv("build"),
+        });
+        outcome.add_phase_result(PhaseResult {
+            phase: Phase::Test,
+            duration: Duration::from_millis(5678),
+            process_status: Exit::Failure(101),
+            argv: argv("test"),
+        });
+        outcome
+    }
+
+    /// Measure the cumulative cost of `add_scenario_outcome` over a large run.
+    ///
+    /// Run with `cargo test --release -- --ignored --nocapture add_scenario_outcome_cost`.
+    #[test]
+    #[ignore = "measurement, not a correctness check"]
+    fn add_scenario_outcome_cost_for_2000_mutants() {
+        use std::time::Instant;
+        const N: usize = 2000;
+        let mutants = [
+            include_str!("lab.rs"),
+            include_str!("output.rs"),
+            include_str!("outcome.rs"),
+        ]
+        .iter()
+        .flat_map(|code| crate::visit::mutate_source_str(code, &crate::Options::default()).unwrap())
+        .collect_vec();
+        assert!(!mutants.is_empty());
+        let temp_dir = TempDir::new().unwrap();
+        let mut output_dir = OutputDir::new(temp_dir.path().try_into().unwrap()).unwrap();
+        let outcomes = mutants
+            .iter()
+            .cycle()
+            .take(N)
+            .map(|mutant| realistic_mutant_outcome(&mut output_dir, mutant.clone()))
+            .collect_vec();
+        let mut total = Duration::ZERO;
+        let mut max = Duration::ZERO;
+        for outcome in &outcomes {
+            let start = Instant::now();
+            output_dir.add_scenario_outcome(outcome).unwrap();
+            let elapsed = start.elapsed();
+            total += elapsed;
+            max = max.max(elapsed);
+        }
+        let json_path = output_dir.path().join("outcomes.json");
+        let start = Instant::now();
+        output_dir.finish().unwrap();
+        let finish = start.elapsed();
+        let final_len = json_path.metadata().unwrap().len();
+        println!(
+            "{N} outcomes added as fast as possible: add_scenario_outcome total {total:?}, \
+             max per call {max:?}; finish {finish:?}; \
+             final outcomes.json {final_len} bytes ({} bytes/outcome)",
+            final_len / N as u64
+        );
     }
 }

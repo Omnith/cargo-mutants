@@ -15,12 +15,13 @@ use tracing::{debug, debug_span, warn};
 use crate::Result;
 use crate::build_dir::BuildDir;
 use crate::console::Console;
+use crate::fail_fast::KnownTests;
 use crate::interrupt::check_interrupted;
 use crate::options::{Options, TestTool};
 use crate::outcome::{Phase, PhaseResult};
 use crate::output::ScenarioOutput;
 use crate::package::PackageSelection;
-use crate::process::{Exit, Process};
+use crate::process::{Exit, Process, TERMINATES_DESCENDANTS};
 
 // Allowed nextest codes (those will be considered a mutation caught / ignored without a warning)
 const NEXTEST_ALLOWED_CODES: &[i32] = &[
@@ -30,6 +31,8 @@ const NEXTEST_ALLOWED_CODES: &[i32] = &[
 ];
 
 /// Run cargo build, check, or test.
+///
+/// When testing, if any of `stop_on_failure` fail, the tests are stopped.
 #[allow(clippy::too_many_arguments)] // I agree it's a lot but I'm not sure wrapping in a struct would be better.
 pub fn run_cargo(
     build_dir: &BuildDir,
@@ -40,21 +43,12 @@ pub fn run_cargo(
     scenario_output: &mut ScenarioOutput,
     options: &Options,
     console: &Console,
+    stop_on_failure: Option<&KnownTests>,
 ) -> Result<PhaseResult> {
     let _span = debug_span!("run", ?phase).entered();
     let start = Instant::now();
     let argv = cargo_argv(packages, phase, options);
-    let mut env = vec![
-        // The tests might use Insta <https://insta.rs>, and we don't want it to write
-        // updates to the source tree, and we *certainly* don't want it to write
-        // updates and then let the test pass.
-        ("INSTA_UPDATE".to_owned(), "no".to_owned()),
-        ("INSTA_FORCE_PASS".to_owned(), "0".to_owned()),
-    ];
-    if let Some(encoded_rustflags) = encoded_rustflags(options) {
-        debug!(?encoded_rustflags);
-        env.push(("CARGO_ENCODED_RUSTFLAGS".to_owned(), encoded_rustflags));
-    }
+    let env = build_dir_cargo_env(build_dir, options);
     let process_status = Process::run(
         &argv,
         &env,
@@ -63,6 +57,7 @@ pub fn run_cargo(
         jobserver,
         scenario_output,
         console,
+        stop_on_failure.filter(|_| phase == Phase::Test && TERMINATES_DESCENDANTS),
     )?;
     check_interrupted()?;
     debug!(?process_status, elapsed = ?start.elapsed());
@@ -82,6 +77,51 @@ pub fn run_cargo(
     })
 }
 
+/// Environment variables set for every cargo invocation.
+pub(crate) fn cargo_env(options: &Options) -> Vec<(String, String)> {
+    let mut env = vec![
+        // The tests might use Insta <https://insta.rs>, and we don't want it to write
+        // updates to the source tree, and we *certainly* don't want it to write
+        // updates and then let the test pass.
+        ("INSTA_UPDATE".to_owned(), "no".to_owned()),
+        ("INSTA_FORCE_PASS".to_owned(), "0".to_owned()),
+    ];
+    if let Some(encoded_rustflags) = encoded_rustflags(options) {
+        debug!(?encoded_rustflags);
+        env.push(("CARGO_ENCODED_RUSTFLAGS".to_owned(), encoded_rustflags));
+    }
+    env
+}
+
+/// Environment variables for cargo run in `build_dir`: those of [`cargo_env`], and
+/// `CARGO_TARGET_DIR` naming the build dir's own `target/`, unless mutants are tested
+/// in place.
+///
+/// A target dir that the user sets in the environment or in cargo config would
+/// otherwise be shared by all the build dirs, so that concurrent jobs would build into
+/// it at once and test each other's mutants. `CARGO_TARGET_DIR` takes precedence over
+/// both. In place, there's only one build dir, which is the user's own tree, so their
+/// setting is kept.
+pub(crate) fn build_dir_cargo_env(
+    build_dir: &BuildDir,
+    options: &Options,
+) -> Vec<(String, String)> {
+    let mut env = cargo_env(options);
+    if !options.in_place {
+        let target_dir = build_dir.path().join("target");
+        for name in ["CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"] {
+            if let Some(value) = env::var_os(name) {
+                debug!(
+                    %target_dir,
+                    "Overriding {name}={value:?} from the environment with the build dir's own target dir"
+                );
+            }
+        }
+        env.push(("CARGO_TARGET_DIR".to_owned(), target_dir.into_string()));
+    }
+    env
+}
+
 /// Return the name of the cargo binary.
 pub fn cargo_bin() -> String {
     // When run as a Cargo subcommand, which is the usual/intended case,
@@ -93,7 +133,11 @@ pub fn cargo_bin() -> String {
 /// Make up the argv for a cargo check/build/test invocation, including argv[0] as the
 /// cargo binary itself.
 // (This is split out so it's easier to test.)
-fn cargo_argv(packages: &PackageSelection, phase: Phase, options: &Options) -> Vec<String> {
+pub(crate) fn cargo_argv(
+    packages: &PackageSelection,
+    phase: Phase,
+    options: &Options,
+) -> Vec<String> {
     let mut cargo_args = vec![cargo_bin()];
     match phase {
         Phase::Test => match &options.test_tool() {
@@ -213,6 +257,27 @@ mod test {
     };
 
     use super::*;
+
+    #[test]
+    fn build_dir_cargo_env_sets_cargo_target_dir_to_own_target_except_in_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let build_dir = BuildDir::in_place(tmp.path().try_into().unwrap()).unwrap();
+        let target_dir = |options: &Options| {
+            build_dir_cargo_env(&build_dir, options)
+                .into_iter()
+                .find(|(name, _)| name == "CARGO_TARGET_DIR")
+                .map(|(_, value)| value)
+        };
+        assert_eq!(
+            target_dir(&Options::default()),
+            Some(build_dir.path().join("target").into_string())
+        );
+        let in_place = Options {
+            in_place: true,
+            ..Options::default()
+        };
+        assert_eq!(target_dir(&in_place), None);
+    }
 
     #[test]
     fn generate_cargo_args_for_baseline_with_default_options() {

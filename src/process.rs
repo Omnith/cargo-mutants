@@ -20,11 +20,22 @@ use tracing::{Level, debug, span, trace};
 
 use crate::Result;
 use crate::console::Console;
+use crate::fail_fast::{FailureWatch, KnownTests};
 use crate::interrupt::check_interrupted;
 use crate::output::ScenarioOutput;
 
 /// How frequently to check if a subprocess finished.
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// The exit code of libtest, and so of `cargo test`, when a test fails.
+const TEST_FAILED_EXIT_CODE: i32 = 101;
+
+/// True if terminating a process also terminates its descendants.
+///
+/// On Unix the child runs in its own process group, which is signalled as a whole.
+/// On Windows only the child itself is killed, so killing `cargo test` would leave
+/// the test binary running.
+pub const TERMINATES_DESCENDANTS: bool = cfg!(unix);
 
 #[cfg(windows)]
 mod windows;
@@ -45,6 +56,11 @@ pub struct Process {
 impl Process {
     /// Run a subprocess to completion, watching for interrupts, with a timeout, while
     /// ticking the progress bar.
+    ///
+    /// If `stop_on_failure` is given, the process is killed as soon as it reports that
+    /// one of those tests failed, and the result is a failure with exit code 101, as
+    /// libtest and `cargo test` would eventually have returned.
+    #[allow(clippy::too_many_arguments)]
     pub fn run(
         argv: &[String],
         env: &[(String, String)],
@@ -53,11 +69,37 @@ impl Process {
         jobserver: Option<&jobserver::Client>,
         scenario_output: &mut ScenarioOutput,
         console: &Console,
+        stop_on_failure: Option<&KnownTests>,
     ) -> Result<Exit> {
+        // Start watching before the child can write anything.
+        let log_path = scenario_output.output_dir.join(scenario_output.log_path());
+        let mut failure_watch = stop_on_failure
+            .map(|known_tests| FailureWatch::new(known_tests, &log_path))
+            .transpose()?;
         let mut child = Process::start(argv, env, cwd, timeout, jobserver, scenario_output)?;
         let process_status = loop {
             if let Some(exit_status) = child.poll()? {
                 break exit_status;
+            }
+            if let Some(test_name) = failure_watch
+                .as_mut()
+                .map(FailureWatch::poll)
+                .transpose()?
+                .flatten()
+            {
+                let elapsed = child.start.elapsed();
+                child.terminate()?;
+                debug!(test_name, ?elapsed, "stopped tests after failure");
+                let message = match &scenario_output.rerun_command {
+                    Some(command) => format!(
+                        "stopped tests: {test_name} failed; rerun this mutant with complete output: {command}"
+                    ),
+                    None => {
+                        format!("stopped tests: {test_name} failed (see --stop-tests-on-failure)")
+                    }
+                };
+                scenario_output.message(&message)?;
+                break Exit::Failure(TEST_FAILED_EXIT_CODE);
             }
             console.tick();
             sleep(WAIT_POLL_INTERVAL);

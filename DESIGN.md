@@ -25,6 +25,14 @@ is checked during long-running operations.
 `lab.rs` -- A mutants "lab": manages generating and testing mutants. Contains
 effectively the main loop of the program: build and test every mutant.
 
+`schemata/` -- Mutant schemata, the default way of testing mutants: build all the
+mutants that can be embedded into one program, select each at runtime, and hand the
+rest to `lab.rs`. `schemata/coverage/` selects each mutant's tests from per-test
+coverage. See the module docs and `book/src/schemata.md`.
+
+`fail_fast.rs` -- Stop a mutant's tests at the first failed test, and say how to
+rerun that mutant with complete output.
+
 `log_file.rs` -- Manage one log file per mutant scenario, within the output dir.
 
 `mutate.rs` -- Different types of mutations we can apply, based on the AST from

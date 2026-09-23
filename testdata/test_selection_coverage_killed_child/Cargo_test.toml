@@ -1,0 +1,16 @@
+# A tree for `cargo mutants --test-selection=coverage` where an integration test
+# kills the binary it runs, as a test of a server might.
+#
+# A killed process writes no coverage profile, so `triple`, which only the killed
+# binary executes, looks as if no test executes it, although the integration test
+# checks its result. Its mutants must still be caught, as they are without test
+# selection. `untested` really is executed by no test, and `double` by a unit test.
+
+[package]
+name = "cargo-mutants-testdata-test-selection-coverage-killed-child"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+doctest = false

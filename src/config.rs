@@ -20,7 +20,7 @@ use serde::Deserialize;
 use tracing::debug;
 
 use crate::Result;
-use crate::options::Common;
+use crate::options::{Common, TestSelection};
 
 // NOTE: Docstrings on this struct and its members turn into descriptions in the JSON schema,
 // so keep them focused on the externally-visible behavior.
@@ -48,6 +48,8 @@ pub struct Config {
     pub copy_vcs: Option<bool>,
     /// Copy the /target directory to build directories.
     pub copy_target: Option<bool>,
+    /// Seed the target directory of each extra parallel build directory from the baseline build (default true).
+    pub seed_target: Option<bool>,
     /// Generate these error values from functions returning Result.
     pub error_values: Vec<String>,
     /// Generate mutants from source files matching these globs.
@@ -72,14 +74,22 @@ pub struct Config {
     pub output: Option<String>,
     /// Cargo profile.
     pub profile: Option<String>,
+    /// Build all the mutants it can into one program, selecting each at runtime, rather
+    /// than building each mutant separately (default true).
+    pub schemata: Option<bool>,
     /// Skip calls to functions or methods with these names.
     ///
     /// This is combined with values from the --skip-calls argument.
     pub skip_calls: Vec<String>,
     /// Use built-in defaults for `skip_calls` in addition to any explicit values.
     pub skip_calls_defaults: Option<bool>,
+    /// Stop testing a mutant as soon as the test harness reports a failed test.
+    pub stop_tests_on_failure: Option<bool>,
     /// Run tests from these packages for all mutants.
     pub test_package: Vec<String>,
+    /// Which tests to run for each mutant built into a schema: `coverage` (the default)
+    /// runs only the tests that execute the mutated code; `all` runs all of them.
+    pub test_selection: Option<TestSelection>,
 
     /// Run tests from all packages in the workspace, not just the mutated package.
     ///

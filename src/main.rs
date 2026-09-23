@@ -18,6 +18,7 @@ mod config;
 mod console;
 mod copy_tree;
 mod exit_code;
+mod fail_fast;
 mod fnvalue;
 mod glob;
 mod in_diff;
@@ -34,6 +35,7 @@ mod path;
 mod pretty;
 mod process;
 mod scenario;
+mod schemata;
 mod shard;
 mod source;
 mod span;
@@ -53,7 +55,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, anyhow};
 use camino::{Utf8Path, Utf8PathBuf};
 use clap::{
-    ArgAction, CommandFactory, Parser, ValueEnum,
+    ArgAction, ArgMatches, CommandFactory, FromArgMatches, Parser, ValueEnum,
     builder::{Styles, styling},
 };
 use clap_complete::{Shell, generate};
@@ -70,11 +72,12 @@ use crate::{
     lab::test_mutants,
     list::{list_files, list_mutants},
     mutant::{Genre, Mutant},
-    options::{Colors, Common, Options},
+    options::{Colors, Common, Options, TestSelection},
     outcome::{Phase, ScenarioOutcome},
     output::{OutputDir, load_previously_caught},
     package::Package,
     scenario::Scenario,
+    schemata::coverage::collect::LlvmTools,
     shard::Shard,
     source::SourceFile,
     visit::walk_file,
@@ -203,6 +206,13 @@ pub struct Args {
     #[arg(long, help_heading = "Copying", group = "copy_opts", hide = true)]
     no_copy_target: bool,
 
+    /// Seed the target directory of each extra parallel build directory from the baseline build.
+    ///
+    /// This avoids rebuilding all dependencies in each build directory when using `--jobs`.
+    /// Default true; use `--seed-target=false` to turn it off.
+    #[arg(long, help_heading = "Copying")]
+    seed_target: Option<bool>,
+
     // Debug ==========
     /// Don't delete the scratch directories, for debugging.
     #[arg(long, help_heading = "Debug")]
@@ -309,6 +319,33 @@ pub struct Args {
     #[arg(long, help_heading = "Execution")]
     no_shuffle: bool,
 
+    /// Build all the mutants it can into one program, selecting each at runtime, rather than building each mutant separately [default: true].
+    ///
+    /// Mutants that can't be built in are tested separately. If an option that schemata
+    /// don't support is in effect, such as --test-tool=nextest, --in-place, --check, or
+    /// --baseline=skip, every mutant is built separately.
+    #[arg(
+        long,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        overrides_with = "no_schemata",
+        help_heading = "Execution"
+    )]
+    schemata: Option<bool>,
+
+    /// Build and test each mutant separately, rather than building them into one program.
+    #[arg(long, overrides_with = "schemata", help_heading = "Execution")]
+    no_schemata: bool,
+
+    /// With schemata, which tests to run for each mutant [default: coverage].
+    ///
+    /// `coverage` runs only the tests that execute the mutated code, according to
+    /// coverage of the unmutated tree, and needs the llvm-tools rustup component; without
+    /// it, all tests run. `all` runs all the tests.
+    #[arg(long, value_enum, help_heading = "Execution")]
+    test_selection: Option<TestSelection>,
+
     /// Run only one shard of all generated mutants: specify as e.g. 1/4.
     #[arg(long, help_heading = "Execution")]
     shard: Option<Shard>,
@@ -319,6 +356,14 @@ pub struct Args {
     /// in random order.
     #[arg(long, help_heading = "Execution", conflicts_with = "no_shuffle")]
     shuffle: bool,
+
+    /// Stop testing a mutant as soon as the test harness reports a failed test [default: true].
+    ///
+    /// libtest reports each failure as it happens but otherwise runs the remaining
+    /// tests in the binary. The mutant is caught once any test fails, so cargo-mutants
+    /// kills the tests then, rather than waiting for them.
+    #[arg(long, help_heading = "Execution")]
+    stop_tests_on_failure: Option<bool>,
 
     /// Maximum run time for all cargo commands, in seconds.
     #[arg(long, short = 't', help_heading = "Execution")]
@@ -503,8 +548,10 @@ pub struct Args {
 }
 
 fn main() -> Result<ExitCode> {
-    let args = match Cargo::try_parse() {
-        Ok(Cargo::Mutants(args)) => args,
+    // With `--test-selection=coverage`, cargo runs cargo-mutants as a rustc wrapper.
+    schemata::coverage::collect::run_as_rustc_wrapper_if_requested();
+    let (args, arg_matches) = match parse_command_line() {
+        Ok(parsed) => parsed,
         Err(e) => {
             e.print().expect("Failed to show clap error message");
             // Clap by default exits with code 2.
@@ -623,14 +670,42 @@ fn main() -> Result<ExitCode> {
         print!("{}", list_mutants(&mutants, &options));
         Ok(ExitCode::Success)
     } else {
-        let output_dir = OutputDir::new(&output_parent_dir)?;
+        // Reject invalid options before the output dir rotates away any previous results.
+        let use_schemata = schemata::enabled(&options)?;
+        if use_schemata
+            && options.test_selection.value == TestSelection::Coverage
+            && options.test_selection.on_command_line
+        {
+            LlvmTools::find(workspace.root())?;
+        }
+        let mut output_dir = OutputDir::new(&output_parent_dir)?;
+        let rerun = fail_fast::Rerun::new(&arg_matches, output_dir.path());
+        output_dir.set_rerun(rerun);
+        output_dir.set_discovery_order(&mutants);
         if let Some(previously_caught) = previously_caught {
             output_dir.write_previously_caught(&previously_caught)?;
         }
         console.set_debug_log(output_dir.open_debug_log()?);
-        let lab_outcome = test_mutants(mutants, &workspace, output_dir, &options, &console)?;
+        let lab_outcome = if use_schemata {
+            schemata::test_mutants(mutants, &workspace, output_dir, &options, &console)?
+        } else {
+            test_mutants(mutants, &workspace, output_dir, &options, &console)?
+        };
         Ok(lab_outcome.exit_code())
     }
+}
+
+/// Parse the command line into the `mutants` subcommand's arguments, and the matches
+/// they came from, which say how each argument was given.
+fn parse_command_line() -> Result<(Args, ArgMatches), clap::Error> {
+    let matches = Cargo::command().try_get_matches()?;
+    let Cargo::Mutants(args) =
+        Cargo::from_arg_matches(&matches).map_err(|err| err.format(&mut Cargo::command()))?;
+    let arg_matches = matches
+        .subcommand_matches("mutants")
+        .expect("mutants subcommand")
+        .clone();
+    Ok((args, arg_matches))
 }
 
 fn emit_schema(schema_type: SchemaType) -> Result<()> {

@@ -1,0 +1,10 @@
+# A package whose mutants can be embedded in the schema, with passing tests.
+
+[package]
+name = "cargo-mutants-testdata-schemata-embedded"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+doctest = false

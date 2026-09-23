@@ -17,5 +17,7 @@ jobs:
           prepare: |
             pkg refresh
             pkg install developer/build/onbld rust
+          # The Rust package has no rustup llvm-tools component, so the tests of
+          # coverage-based test selection are skipped, although CI is set in the VM.
           run: |
-            cargo test
+            CARGO_MUTANTS_TESTS_ALLOW_MISSING_LLVM_TOOLS=1 cargo test

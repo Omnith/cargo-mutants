@@ -1,0 +1,9 @@
+# A workspace where every mutant of one package falls back from the schema,
+# because they're all in a `const fn`, and that package's tests fail in the
+# unmutated tree. `cargo mutants --schemata` must run the baseline for the
+# fallback package's tests too, and stop just as the classic way does, rather
+# than reporting its mutants as caught.
+
+[workspace]
+members = ["embedded", "const_only"]
+resolver = "2"

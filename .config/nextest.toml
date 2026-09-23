@@ -1,0 +1,7 @@
+# Configuration for cargo-nextest: <https://nexte.st/docs/configuration/>
+
+# Tests that need the llvm-tools rustup component say on stderr when they're skipped
+# because it's not installed; show that even though they pass.
+[[profile.default.overrides]]
+filter = 'test(/^test_selection_coverage_/)'
+success-output = "final"

@@ -54,7 +54,7 @@ jobs:
   cargo-mutants:
     runs-on: ubuntu-latest
     # Often you'll want to only run this after the build is known to pass its basic tests,
-    # to avoid wasting time, and to allow using --baseline=skip.
+    # to avoid wasting time.
     needs: [test]
     strategy:
       fail-fast: false # Collect all mutants even if some are missed
@@ -63,6 +63,10 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          # Lets each mutant run only the tests that execute its code.
+          components: llvm-tools
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         name: Install cargo-mutants using install-action
@@ -72,7 +76,7 @@ jobs:
       # The denominator of the shard count must be the number of shards.
       - name: Mutants
         run: |
-          cargo mutants --no-shuffle -vV --shard ${{ matrix.shard }}/8 --baseline=skip --timeout 300 --in-place
+          cargo mutants --no-shuffle -vV --shard ${{ matrix.shard }}/8 --timeout 300
       - name: Archive mutants.out
         uses: actions/upload-artifact@v7
         if: always()

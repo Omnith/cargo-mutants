@@ -95,7 +95,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.version }}
-          components: rustfmt
+          # llvm-tools, so that the tests of coverage-based test selection run.
+          components: rustfmt, llvm-tools
       - name: Show Cargo and rustc version
         run: |
           cargo --version
@@ -129,6 +130,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly
+          components: llvm-tools
       - uses: taiki-e/install-action@v2
         name: Install nextest using install-action
         with:
@@ -195,6 +197,8 @@ jobs:
         with:
           save-if: false
       - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: llvm-tools
       - run: cargo package --no-verify
       - name: Upload package artifact
         uses: actions/upload-artifact@v7
@@ -236,6 +240,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: beta
+          # The mutants run the tests, including those needing llvm-tools.
+          components: llvm-tools
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: false
@@ -280,6 +286,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: beta
+          # The mutants run the tests, including those needing llvm-tools.
+          components: llvm-tools
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: false
@@ -322,6 +330,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly
+          # The mutants run the tests, including those needing llvm-tools.
+          components: llvm-tools
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: false

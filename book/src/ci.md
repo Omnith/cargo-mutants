@@ -10,7 +10,8 @@ There are at least two complementary ways to use cargo-mutants in CI:
 
 ## Recommendations for CI
 
-* Use the [`--in-place`](in-place.md) option to avoid copying the tree.
+* Install the `llvm-tools` rustup component, so that each mutant runs only the tests that execute its code. See [Improving performance](performance.md#in-ci).
+* Don't use [`--in-place`](in-place.md) just to avoid copying the tree: it turns off [schemata](schemata.md), which build the tree once for all mutants.
 
 ## Installing into CI
 

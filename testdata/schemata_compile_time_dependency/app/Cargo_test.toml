@@ -1,0 +1,16 @@
+# Uses `table` in its build script and `macros` in its library.
+
+[package]
+name = "cargo-mutants-testdata-schemata-compile-time-dependency"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+doctest = false
+
+[dependencies]
+macros = { path = "../macros" }
+
+[build-dependencies]
+table = { path = "../table" }

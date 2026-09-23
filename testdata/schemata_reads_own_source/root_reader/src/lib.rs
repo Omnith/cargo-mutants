@@ -1,0 +1,15 @@
+pub fn add(a: u32, b: u32) -> u32 {
+    a + b
+}
+
+pub fn sub(a: u32, b: u32) -> u32 {
+    a - b
+}
+
+#[cfg(test)]
+mod test {
+    #[test]
+    fn add() {
+        assert_eq!(super::add(2, 3), 5);
+    }
+}

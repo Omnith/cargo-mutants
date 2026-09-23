@@ -203,7 +203,10 @@ fn small_well_tested_tree_is_clean() {
     let tmp_src_dir = copy_of_testdata("small_well_tested");
     run()
         .arg("mutants")
-        .args(["--no-times", "--no-shuffle", "-v", "-V"])
+        // One job, so that mutants are reported in order.
+        .args(["--no-times", "--no-shuffle", "-j1", "-v", "-V"])
+        // Let the tests finish so that the log has the failed test's output, checked below.
+        .arg("--stop-tests-on-failure=false")
         .current_dir(tmp_src_dir.path())
         .assert()
         .success()
@@ -269,6 +272,67 @@ fn small_well_tested_tree_is_clean() {
 }
 
 #[test]
+fn show_times_prints_timing_breakdown_before_summary_for_small_well_tested() {
+    let tmp_src_dir = copy_of_testdata("small_well_tested");
+    let output = run()
+        .arg("mutants")
+        // Embedded mutants have no build phase, so this shows the classic breakdown.
+        .args(["--no-schemata", "--no-shuffle", "-j2"])
+        .current_dir(tmp_src_dir.path())
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    println!("{stdout}");
+    let lines: Vec<&str> = stdout.lines().collect();
+    let time_line = lines
+        .iter()
+        .position(|l| l.starts_with("Time: "))
+        .expect("timing breakdown is printed");
+    assert!(
+        is_match(r"^Time: \d+s cargo busy in \d+s wall with 2 workers \(\d+% utilized\); baseline [0-9.]+s build \+ [0-9.]+s test$")
+            .unwrap()
+            .eval(lines[time_line]),
+        "unexpected time line: {:?}",
+        lines[time_line]
+    );
+    assert!(lines[time_line + 1].starts_with("  build 4 mutants: median "));
+    assert!(lines[time_line + 2].starts_with("  test 4 mutants: median "));
+    assert!(lines[time_line + 3].starts_with("  by outcome: 4 caught "));
+    assert!(lines[time_line + 4].starts_with("  slowest: "));
+    // The summary line stays last, so anything reading the last line is unaffected.
+    assert!(lines.last().unwrap().starts_with("4 mutants tested in "));
+}
+
+#[test]
+fn no_times_omits_timing_breakdown_from_stdout_but_debug_log_has_it() {
+    let tmp_src_dir = copy_of_testdata("small_well_tested");
+    run()
+        .arg("mutants")
+        .args(["--no-schemata", "--no-times", "--no-shuffle"])
+        .current_dir(tmp_src_dir.path())
+        .assert()
+        .success()
+        .stdout(contains("cargo busy").not());
+    let debug_log = read_to_string(tmp_src_dir.path().join("mutants.out/debug.log")).unwrap();
+    for event in [
+        "timing.lab",
+        "timing.phase",
+        "timing.baseline_phase",
+        "timing.outcome",
+        "timing.slowest",
+    ] {
+        assert!(
+            debug_log.contains(&format!(": {event} ")),
+            "debug.log lacks {event}:\n{debug_log}"
+        );
+    }
+    assert!(debug_log.contains("timing.phase phase=\"build\" count=4 "));
+    assert!(debug_log.contains("timing.outcome outcome=CaughtMutant count=4 "));
+}
+
+#[test]
 fn test_small_well_tested_tree_with_baseline_skip() {
     let tmp_src_dir = copy_of_testdata("small_well_tested");
     run()
@@ -301,7 +365,7 @@ fn cdylib_tree_is_well_tested() {
     let tmp_src_dir = copy_of_testdata("cdylib");
     run()
         .arg("mutants")
-        .args(["--no-times", "--no-shuffle", "-v", "-V"])
+        .args(["--no-times", "--no-shuffle", "-j1", "-v", "-V"])
         .current_dir(tmp_src_dir.path())
         .assert()
         .success()
@@ -335,7 +399,8 @@ fn integration_test_source_is_not_mutated() {
         .success()
         .stdout("src/lib.rs\n");
     run()
-        .args(["mutants", "--no-times", "--no-shuffle"])
+        // One job, so that the mutants are listed in order.
+        .args(["mutants", "--no-times", "--no-shuffle", "-j1"])
         .current_dir(tmp_src_dir.path())
         .assert()
         .success();
@@ -350,6 +415,9 @@ fn uncaught_mutant_in_factorial() {
         .arg("mutants")
         .arg("--no-shuffle")
         .arg("--no-times")
+        // So that the logs listed below don't depend on the number of CPUs, or on
+        // whether llvm-tools is installed.
+        .args(["-j1", "--test-selection=all"])
         .arg("-d")
         .arg(tmp_src_dir.path())
         .assert()
@@ -994,7 +1062,7 @@ fn mutants_are_unapplied_after_testing_so_later_missed_mutants_are_found() {
     // uncaught mutant is not the first file tested.
     let tmp_src_dir = copy_of_testdata("unapply");
     run()
-        .args(["mutants", "--no-times", "--no-shuffle"])
+        .args(["mutants", "--no-times", "--no-shuffle", "-j1"])
         .arg("-d")
         .arg(tmp_src_dir.path())
         .assert()
@@ -1507,6 +1575,72 @@ fn interrupt_caught_and_kills_children() {
     assert!(!stderr.contains("Worker thread failed"));
 }
 
+/// When cargo-mutants is interrupted, `outcomes.json` still records every mutant that
+/// finished before the interruption: the same ones listed in `caught.txt`, etc.
+#[cfg(unix)]
+#[test]
+fn interrupted_run_leaves_complete_outcomes_json() {
+    use std::process::{Command, Stdio};
+    use std::thread::sleep;
+    use std::time::{Duration, Instant};
+
+    use nix::{
+        sys::signal::{SIGTERM, kill},
+        unistd::Pid,
+    };
+
+    use crate::integration_util::main_binary;
+
+    let tmp_src_dir = copy_of_testdata("well_tested");
+    let out_dir = tmp_src_dir.path().join("mutants.out");
+    let list_lines = || -> usize {
+        ["caught.txt", "missed.txt", "timeout.txt", "unviable.txt"]
+            .iter()
+            .map(|name| {
+                read_to_string(out_dir.join(name))
+                    .unwrap_or_default()
+                    .lines()
+                    .count()
+            })
+            .sum()
+    };
+    let mut child = Command::new(main_binary())
+        .args(["mutants", "--timeout=300", "--baseline=skip"])
+        .current_dir(&tmp_src_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn child");
+
+    // Interrupt after a few mutants have been tested, but before the run completes.
+    let deadline = Instant::now() + OUTER_TIMEOUT;
+    while list_lines() < 3 {
+        assert!(Instant::now() < deadline, "timed out waiting for mutants");
+        assert!(
+            child.try_wait().expect("try to wait for child").is_none(),
+            "child exited early"
+        );
+        sleep(Duration::from_millis(50));
+    }
+    kill(Pid::from_raw(child.id().cast_signed()), SIGTERM).expect("send SIGTERM");
+    let status = child.wait().expect("wait for child after SIGTERM");
+    assert!(!status.success());
+
+    let json: serde_json::Value = serde_json::from_str(
+        &read_to_string(out_dir.join("outcomes.json")).expect("read outcomes.json"),
+    )
+    .expect("parse outcomes.json");
+    assert_eq!(json["total_mutants"], list_lines());
+    assert_eq!(json["outcomes"].as_array().unwrap().len(), list_lines());
+    assert_eq!(json["end_time"], serde_json::Value::Null);
+    let names = read_dir(&out_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains("outcomes"))
+        .collect_vec();
+    assert_eq!(names, ["outcomes.json"]);
+}
+
 #[test]
 fn env_var_controls_trace() {
     let tmp = copy_of_testdata("never_type");
@@ -1654,6 +1788,7 @@ fn jobs_option_accepted_and_causes_multiple_threads() {
     let testdata = copy_of_testdata("small_well_tested");
     run()
         .arg("mutants")
+        .arg("--no-schemata")
         .arg("-d")
         .arg(testdata.path())
         .arg("-j2")
@@ -1677,6 +1812,68 @@ fn jobs_option_accepted_and_causes_multiple_threads() {
         matches.len() > 1,
         "expected more than {} thread ids in debug log",
         matches.len()
+    );
+}
+
+/// Run `cargo mutants -j2` on the `seed_target` tree, with extra args, and check that
+/// every mutant in package `a` is missed.
+///
+/// If the seeded build dir reused package `c` as built in the baseline build dir, a test
+/// in `a` would fail there and the mutants tested in it would be caught instead.
+///
+/// Returns the debug log.
+fn run_seed_target_tree_and_assert_all_missed(extra_args: &[&str]) -> String {
+    let testdata = copy_of_testdata("seed_target");
+    run()
+        .args(["mutants", "--no-schemata", "-j2", "--no-times"])
+        .args(extra_args)
+        .arg("-d")
+        .arg(testdata.path())
+        .timeout(OUTER_TIMEOUT)
+        .assert()
+        .code(2); // missed mutants
+    let debug_log =
+        read_to_string(testdata.path().join("mutants.out/debug.log")).expect("read debug log");
+    assert_eq!(
+        outcome_json_counts(&testdata),
+        json!({
+            "caught": 0,
+            "missed": 4,
+            "success": 0,
+            "timeout": 0,
+            "total_mutants": 4,
+            "unviable": 0,
+        }),
+        "debug log:\n{debug_log}"
+    );
+    // Both build dirs must have tested at least one mutant, otherwise this test
+    // proves nothing about the second one.
+    let build_dirs_testing_mutants = Regex::new(r"worker thread\{build_dir=(\S+)\}:mutant\{")
+        .unwrap()
+        .captures_iter(&debug_log)
+        .map(|c| c[1].to_owned())
+        .unique()
+        .count();
+    assert_eq!(build_dirs_testing_mutants, 2, "debug log:\n{debug_log}");
+    debug_log
+}
+
+#[test]
+fn seed_target_rebuilds_workspace_packages_in_seeded_build_dir() {
+    let debug_log = run_seed_target_tree_and_assert_all_missed(&[]);
+    assert_eq!(
+        debug_log.matches("Seeded target dir").count(),
+        1,
+        "expected one seeded build dir with -j2; debug log:\n{debug_log}"
+    );
+}
+
+#[test]
+fn seed_target_false_gives_same_outcomes_without_seeding() {
+    let debug_log = run_seed_target_tree_and_assert_all_missed(&["--seed-target=false"]);
+    assert!(
+        !debug_log.contains("Seeded target dir"),
+        "debug log:\n{debug_log}"
     );
 }
 
@@ -1740,7 +1937,7 @@ fn iterate_retries_missed_mutants() {
 
     run()
         .arg("mutants")
-        .arg("--no-shuffle")
+        .args(["--no-shuffle", "-j1"])
         .arg("-d")
         .arg(temp.path())
         .assert()
@@ -1782,7 +1979,7 @@ fn iterate_retries_missed_mutants() {
 
     run()
         .arg("mutants")
-        .arg("--no-shuffle")
+        .args(["--no-shuffle", "-j1"])
         .arg("-d")
         .arg(temp.path())
         .assert()
@@ -1999,7 +2196,7 @@ fn list_mutants_changed_in_diff1() {
     let tmp = copy_of_testdata("diff1");
 
     run()
-        .args(["mutants", "--no-shuffle", "-d"])
+        .args(["mutants", "--no-shuffle", "-j1", "-d"])
         .arg(tmp.path())
         .arg("--in-diff")
         .arg(diff_file.path())
@@ -2245,7 +2442,14 @@ fn no_config_option_disables_config_file_so_error_value_is_not_generated() {
     let tmp_src_dir = copy_of_testdata("error_value");
     run()
         .arg("mutants")
-        .args(["-v", "-V", "--no-times", "--no-shuffle", "--no-config"])
+        .args([
+            "-v",
+            "-V",
+            "--no-times",
+            "--no-shuffle",
+            "-j1",
+            "--no-config",
+        ])
         .arg("-d")
         .arg(tmp_src_dir.path())
         .assert()
@@ -2507,7 +2711,7 @@ fn small_well_tested_tree_check_only() {
             ok       src/lib.rs:7:11: replace *= with /= in factorial
             4 mutants tested: 4 succeeded
         "})
-        .stderr("");
+        .stderr(" INFO Not using schemata, since they don't support --check\n");
     let outcomes = outcome_json_counts(&tmp_src_dir);
     assert_eq!(
         outcomes,
@@ -2615,7 +2819,7 @@ fn check_tree_with_mutants_skip() {
             ok       src/lib.rs:21:53: replace * with / in controlled_loop
             6 mutants tested: 6 succeeded
             "})
-        .stderr("");
+        .stderr(" INFO Not using schemata, since they don't support --check\n");
     assert_eq!(
         outcome_json_counts(&tmp_src_dir),
         serde_json::json!({
@@ -2783,7 +2987,8 @@ fn list_files_as_json_in_workspace_subdir() {
 fn workspace_tree_is_well_tested() {
     let tmp_src_dir = copy_of_testdata("workspace");
     run()
-        .args(["mutants", "-d"])
+        // Checks each mutant's classic build and test phases.
+        .args(["mutants", "--no-schemata", "-d"])
         .arg(tmp_src_dir.path())
         .assert()
         .success();
@@ -2906,7 +3111,14 @@ fn workspace_tree_is_well_tested() {
 fn in_workspace_only_relevant_packages_included_in_baseline_tests_by_file_filter() {
     let tmp = copy_of_testdata("package_fails");
     run()
-        .args(["mutants", "-f", "passing/src/lib.rs", "--no-shuffle", "-d"])
+        .args([
+            "mutants",
+            "-f",
+            "passing/src/lib.rs",
+            "--no-shuffle",
+            "-j1",
+            "-d",
+        ])
         .arg(tmp.path())
         .assert()
         .success();
@@ -2943,6 +3155,7 @@ fn baseline_test_respects_package_options() {
             "--package",
             "cargo-mutants-testdata-package-fails-passing",
             "--no-shuffle",
+            "-j1",
             "-d",
         ])
         .arg(tmp.path())
@@ -3845,4 +4058,1577 @@ fn in_diff_with_nonexistent_file_returns_exit_code_6() {
         .assert()
         .code(6)
         .stderr(contains("Failed to read diff file").or(contains("Failed to open diff file")));
+}
+
+// Experimental `--schemata` ============================================================
+
+/// Summaries of each mutant's outcome, by mutant name, from a `mutants.out` directory.
+fn mutant_summaries(mutants_out: &Path) -> std::collections::BTreeMap<String, String> {
+    let outcomes: serde_json::Value = read_to_string(mutants_out.join("outcomes.json"))
+        .expect("read outcomes.json")
+        .parse()
+        .expect("parse outcomes.json");
+    outcomes["outcomes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|outcome| {
+            let name = outcome["scenario"]["Mutant"]["name"].as_str()?;
+            Some((
+                name.to_owned(),
+                outcome["summary"].as_str().unwrap().to_owned(),
+            ))
+        })
+        .collect()
+}
+
+/// Run cargo-mutants classically and with `--schemata` on copies of the same tree,
+/// assert that every mutant, embedded or fallback, has the same outcome both ways and
+/// that embedded and fallback mutants together are all the mutants, and return
+/// `schemata.json`.
+///
+/// `schemata_env` is set only for the `--schemata` run.
+fn assert_schemata_outcomes_match_classic(
+    tree_name: &str,
+    args: &[&str],
+    schemata_env: &[(&str, &str)],
+) -> serde_json::Value {
+    assert_schemata_outcomes_match_classic_with(tree_name, args, &[], schemata_env)
+}
+
+/// Like [`assert_schemata_outcomes_match_classic`], with `schemata_args` given only
+/// to the `--schemata` run.
+fn assert_schemata_outcomes_match_classic_with(
+    tree_name: &str,
+    args: &[&str],
+    schemata_args: &[&str],
+    schemata_env: &[(&str, &str)],
+) -> serde_json::Value {
+    let tmp = copy_of_testdata(tree_name);
+    let classic_out = tempdir().unwrap();
+    let schemata_out = tempdir().unwrap();
+    // Mutants' internals asserted by callers, like which tests ran, assume all the
+    // tests run, unless the caller chooses coverage-based selection.
+    let mut schemata_args = [&["--schemata"], schemata_args].concat();
+    if !schemata_args
+        .iter()
+        .any(|arg| arg.starts_with("--test-selection"))
+    {
+        schemata_args.push("--test-selection=all");
+    }
+    for (out, extra_args, env) in [
+        (&classic_out, ["--no-schemata"].as_slice(), [].as_slice()),
+        (&schemata_out, schemata_args.as_slice(), schemata_env),
+    ] {
+        let output = run()
+            .envs(env.iter().copied())
+            .args(["mutants", "--no-times", "-d"])
+            .arg(tmp.path())
+            .arg("-o")
+            .arg(out.path())
+            .args(args)
+            .args(extra_args)
+            .timeout(std::time::Duration::from_secs(600))
+            .output()
+            .unwrap();
+        println!(
+            "{extra_args:?} stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // Missed mutants and timeouts give nonzero codes, but not a usage or internal error.
+        assert!(
+            matches!(output.status.code(), Some(0 | 2 | 3)),
+            "unexpected exit {:?}",
+            output.status
+        );
+    }
+    let classic = mutant_summaries(&classic_out.path().join("mutants.out"));
+    let schemata_dir = schemata_out.path().join("mutants.out");
+    let schemata = mutant_summaries(&schemata_dir);
+    let report: serde_json::Value = read_to_string(schemata_dir.join("schemata.json"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let embedded: HashSet<&str> = report["mutant_tests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    let fallback: HashSet<&str> = report["fallback_mutants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    let all: HashSet<&str> = classic.keys().map(String::as_str).collect();
+    assert!(embedded.is_disjoint(&fallback));
+    assert_eq!(
+        embedded.union(&fallback).copied().collect::<HashSet<_>>(),
+        all
+    );
+    assert_eq!(
+        schemata.keys().collect_vec(),
+        classic.keys().collect_vec(),
+        "every mutant has an outcome"
+    );
+    let mismatches = classic
+        .keys()
+        .filter(|name| classic[*name] != schemata[*name])
+        .map(|name| {
+            format!(
+                "{name}: classic {} schemata {}",
+                classic[name], schemata[name]
+            )
+        })
+        .collect_vec();
+    assert!(mismatches.is_empty(), "outcomes differ:\n{mismatches:#?}");
+    report
+}
+
+#[test]
+fn schemata_outcomes_match_classic_in_schemata_tree_with_dropped_mutants_recorded_unviable() {
+    // Recording proven-unviable mutants without a build is the default.
+    let report =
+        assert_schemata_outcomes_match_classic("schemata", &["--minimum-test-timeout=5"], &[]);
+    // Tests are replayed directly: the library's unit tests, the integration test
+    // target, then the doctests. The integration target runs only an ignored
+    // test, so it isn't replayed for each mutant.
+    assert_eq!(report["test_exec"], "direct");
+    assert_eq!(report["replay_commands"], 3);
+    assert_eq!(report["idle_commands_skipped"], 1);
+    // Without --jobs, the number of mutants tested at once is measured, starting
+    // from one copy of the tests, up to half the CPUs.
+    let probes = report["jobs_probe"].as_array().unwrap();
+    if std::thread::available_parallelism().unwrap().get() >= 4 {
+        assert_eq!(probes[0]["jobs"], 1);
+        assert!(probes.iter().any(|p| p["jobs"] == report["test_jobs"]));
+    } else {
+        assert!(probes.is_empty());
+        assert_eq!(report["test_jobs"], 1);
+    }
+    let embedded_genres = report["embedded_by_genre"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .collect_vec();
+    assert_eq!(
+        embedded_genres,
+        [
+            "BinaryOperator",
+            "FnValue",
+            "MatchArm",
+            "MatchArmGuard",
+            "UnaryOperator"
+        ]
+    );
+    let fallback_reasons = report["fallback_by_reason"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .collect_vec();
+    assert_eq!(
+        fallback_reasons,
+        [
+            "compile_error",
+            "const_context",
+            "impl_trait_return",
+            "let_chain",
+            "unsupported_genre"
+        ]
+    );
+    // Recorded unviable without a classic build, and still the same outcome as
+    // classic: one from the schema's compile error, one let chain.
+    assert_eq!(report["dropped_mutants"], "unviable");
+    assert_eq!(report["proven_unviable"], 2);
+    let summaries = report["mutant_tests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["summary"].as_str().unwrap())
+        .unique()
+        .sorted()
+        .collect_vec();
+    assert_eq!(summaries, ["CaughtMutant", "MissedMutant", "Timeout"]);
+}
+
+#[test]
+fn schemata_outcomes_match_classic_in_factorial_tree_with_cargo_test_exec() {
+    let report = assert_schemata_outcomes_match_classic(
+        "factorial",
+        &[],
+        &[("CARGO_MUTANTS_SCHEMATA_EXEC", "cargo")],
+    );
+    assert_eq!(report["fallback"], 0);
+    assert_eq!(report["test_exec"], "cargo_test");
+    assert_eq!(report["unexpected_rebuilds"], 0);
+}
+
+#[test]
+fn schemata_outcomes_match_classic_in_well_tested_tree_with_parallel_jobs() {
+    let report = assert_schemata_outcomes_match_classic("well_tested", &["-j", "4"], &[]);
+    assert_eq!(report["test_exec"], "direct");
+    // --jobs is used as given, without measuring.
+    assert_eq!(report["test_jobs"], 4);
+    assert_eq!(report["jobs_probe"].as_array().unwrap().len(), 0);
+}
+
+/// A missed mutant runs every replayed test command, except those that ran no
+/// tests in the baseline, like the `schemata` tree's target whose only test is
+/// ignored.
+#[test]
+fn schemata_in_schemata_tree_skips_test_targets_that_run_no_tests() {
+    let tmp = copy_of_testdata("schemata");
+    let out = tempdir().unwrap();
+    run()
+        .args([
+            "mutants",
+            "--schemata",
+            "--test-selection=all",
+            "--no-times",
+            "-j1",
+        ])
+        .args(["--re", "is_square -> bool with true", "-d"])
+        .arg(tmp.path())
+        .arg("-o")
+        .arg(out.path())
+        .timeout(OUTER_TIMEOUT)
+        .assert()
+        .code(2);
+    let outcomes: serde_json::Value =
+        read_to_string(out.path().join("mutants.out").join("outcomes.json"))
+            .unwrap()
+            .parse()
+            .unwrap();
+    let mutant = outcomes["outcomes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["scenario"]["Mutant"].is_object())
+        .unwrap();
+    assert_eq!(mutant["summary"], "MissedMutant");
+    let programs = mutant["phase_results"][0]["argv"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| {
+            let path = p.as_str().unwrap();
+            path.rsplit(['/', '\\'])
+                .next()
+                .unwrap()
+                .split('-')
+                .next()
+                .unwrap()
+                .to_owned()
+        })
+        .collect_vec();
+    assert_eq!(programs, ["cargo_mutants_testdata_schemata", "rustdoc"]);
+}
+
+#[test]
+fn schemata_stop_after_build_in_schemata_tree_reports_errors_blamed_for_drops_without_testing() {
+    let tmp = copy_of_testdata("schemata");
+    let out = tempdir().unwrap();
+    run()
+        .env("CARGO_MUTANTS_SCHEMATA_STOP_AFTER", "build")
+        .args(["mutants", "--schemata", "--no-times", "-d"])
+        .arg(tmp.path())
+        .arg("-o")
+        .arg(out.path())
+        .timeout(OUTER_TIMEOUT)
+        .assert()
+        .success();
+    let mutants_out = out.path().join("mutants.out");
+    let report: serde_json::Value = read_to_string(mutants_out.join("schemata.json"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(report["mutant_tests"].as_array().unwrap().len(), 0);
+    assert!(mutant_summaries(&mutants_out).is_empty());
+    let dropped = report["fallback_mutants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["reason"] == "compile_error")
+        .collect_vec();
+    assert_eq!(dropped.len(), 1);
+    let started = dropped[0];
+    let name = started["name"].as_str().unwrap();
+    assert!(
+        name.ends_with("replace started -> std::time::Instant with Default::default()"),
+        "{name}"
+    );
+    assert_eq!(started["proven_unviable"], true);
+    let blame = &started["blame"][0];
+    assert_eq!(blame["code"], "E0277");
+    assert_eq!(blame["blamed"], "arm");
+    // The schema keeps the source's lines, so the error is on the mutant's line.
+    let mutant_line = name.split(':').take(2).join(":");
+    assert!(
+        blame["location"]
+            .as_str()
+            .unwrap()
+            .starts_with(&format!("{mutant_line}:")),
+        "{blame}"
+    );
+}
+
+/// With `-j2`, the fallback mutants of a `--schemata` run are tested classically in the
+/// schema's build dir and one build dir seeded from its `target/`; embedded mutants have
+/// only a test phase; and the schema build and the time spent on fallback mutants, by
+/// reason, are logged as timing events.
+#[test]
+fn schemata_fallback_in_schemata_tree_uses_seed_target_and_logs_timing() {
+    let tmp = copy_of_testdata("schemata");
+    // `double` is a const fn, so its mutants fall back; `weighted_sum`'s are embedded.
+    let output = run()
+        .args(["mutants", "--schemata", "--no-times", "-j2"])
+        .args(["--re", "double|weighted_sum", "-d"])
+        .arg(tmp.path())
+        .timeout(OUTER_TIMEOUT)
+        .output()
+        .unwrap();
+    let mutants_out = tmp.path().join("mutants.out");
+    let debug_log = read_to_string(mutants_out.join("debug.log")).unwrap();
+    assert!(
+        matches!(output.status.code(), Some(0 | 2)),
+        "unexpected exit {:?}; debug log:\n{debug_log}",
+        output.status
+    );
+    let report: serde_json::Value = read_to_string(mutants_out.join("schemata.json"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let names = |key: &str| -> HashSet<String> {
+        report[key]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let embedded = names("mutant_tests");
+    let fallback = names("fallback_mutants");
+    assert!(!embedded.is_empty());
+    assert!(fallback.len() >= 2, "fallback: {fallback:?}");
+
+    let outcomes: serde_json::Value = read_to_string(mutants_out.join("outcomes.json"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    for outcome in outcomes["outcomes"].as_array().unwrap() {
+        let Some(name) = outcome["scenario"]["Mutant"]["name"].as_str() else {
+            continue;
+        };
+        let phases = outcome["phase_results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|pr| pr["phase"].as_str().unwrap())
+            .collect_vec();
+        if embedded.contains(name) {
+            assert_eq!(phases, ["Test"], "{name}");
+        } else {
+            assert!(fallback.contains(name), "{name}");
+            assert_eq!(phases[0], "Build", "{name}");
+        }
+    }
+
+    assert_eq!(
+        debug_log.matches("Seeded target dir").count(),
+        1,
+        "expected one seeded build dir for the fallback mutants; debug log:\n{debug_log}"
+    );
+    assert!(
+        debug_log.contains(": timing.schema_build "),
+        "debug log:\n{debug_log}"
+    );
+    assert!(
+        debug_log
+            .lines()
+            .any(|line| line.contains(": timing.schema_fallback reason=ConstContext count=")),
+        "debug log:\n{debug_log}"
+    );
+    let timing_lab = debug_log
+        .lines()
+        .find(|line| line.contains(": timing.lab "))
+        .expect("timing.lab event");
+    assert!(timing_lab.contains(" workers=2 "), "{timing_lab}");
+}
+
+#[test]
+fn schemata_baseline_fails_when_fallback_package_tests_fail_in_schemata_fallback_only_package_tree()
+{
+    // Every mutant of `const_only` falls back, and its tests fail in the unmutated
+    // tree. Its tests are part of the baseline, so no mutants are tested, just as
+    // without --schemata.
+    let tmp = copy_of_testdata("schemata_fallback_only_package");
+    for extra_args in [[].as_slice(), ["--schemata"].as_slice()] {
+        let out = tempdir().unwrap();
+        run()
+            .args(["mutants", "--no-times", "--workspace", "-d"])
+            .arg(tmp.path())
+            .arg("-o")
+            .arg(out.path())
+            .args(extra_args)
+            .timeout(std::time::Duration::from_secs(600))
+            .assert()
+            .code(4);
+        let summaries = mutant_summaries(&out.path().join("mutants.out"));
+        assert!(summaries.is_empty(), "{extra_args:?}: {summaries:?}");
+    }
+}
+
+#[test]
+fn schemata_tests_compile_time_code_classically_in_schemata_compile_time_dependency_tree() {
+    // `table` runs in a build script and `words` in a proc macro, where the mutant id
+    // can't be seen, so their mutants are tested the classic way.
+    let report = assert_schemata_outcomes_match_classic(
+        "schemata_compile_time_dependency",
+        &["--workspace", "--test-workspace=true"],
+        &[],
+    );
+    let fallbacks = schemata_fallbacks(&report);
+    for package in ["table/", "words/", "macros/"] {
+        assert!(
+            fallbacks.iter().any(|(name, _)| name.starts_with(package)),
+            "{package}: {fallbacks:?}"
+        );
+    }
+    for (name, reason) in &fallbacks {
+        let expected = if name.starts_with("macros/") {
+            "proc_macro_crate"
+        } else {
+            assert!(
+                name.starts_with("table/") || name.starts_with("words/"),
+                "{name}"
+            );
+            "compile_time_dependency"
+        };
+        assert_eq!(reason, expected, "{name}");
+    }
+    let tests = schemata_mutant_tests(&report);
+    assert!(!tests.is_empty());
+    assert!(
+        tests.iter().all(|(name, _, _)| name.starts_with("app/")),
+        "{tests:?}"
+    );
+}
+
+#[test]
+fn schemata_is_rejected_with_nextest() {
+    let tmp = copy_of_testdata("factorial");
+    run()
+        .args(["mutants", "--schemata", "--test-tool=nextest", "-d"])
+        .arg(tmp.path())
+        .assert()
+        .code(1)
+        .stderr("Error: --schemata can't be used with --test-tool=nextest\n");
+}
+
+/// The names of the mutants tested with the schema, from `schemata.json`, with their
+/// summaries and whether they were reached.
+fn schemata_mutant_tests(report: &serde_json::Value) -> Vec<(String, String, bool)> {
+    report["mutant_tests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| {
+            (
+                t["name"].as_str().unwrap().to_owned(),
+                t["summary"].as_str().unwrap().to_owned(),
+                t["reached"].as_bool().unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// The names of the fallback mutants, from `schemata.json`, with their reasons.
+fn schemata_fallbacks(report: &serde_json::Value) -> Vec<(String, String)> {
+    report["fallback_mutants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| {
+            (
+                t["name"].as_str().unwrap().to_owned(),
+                t["reason"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn schemata_embeds_files_named_in_source_and_retests_their_missed_mutants_in_schemata_reads_own_source_tree()
+ {
+    // The tests read source files with `include_str!`. Those files are embedded, since
+    // their text is the same for every mutant; but mutants in them that the schema
+    // misses are tested again the classic way, where the mutated text is read.
+    let report =
+        assert_schemata_outcomes_match_classic("schemata_reads_own_source", &["--workspace"], &[]);
+    let read_files = ["module_reader/src/shapes.rs", "root_reader/src/lib.rs"];
+    assert_eq!(report["source_read_files"], json!(read_files));
+    let in_read_file = |name: &str| read_files.iter().any(|f| name.starts_with(f));
+    // The mutated function, from a name like `f.rs:1:2: replace f -> u32 with 0` or
+    // `f.rs:1:2: replace * with + in f`.
+    let function = |name: &str| match name.split_once(" -> ") {
+        Some((before, _)) => before.rsplit(' ').next().unwrap().to_owned(),
+        None => name.rsplit(" in ").next().unwrap().to_owned(),
+    };
+    // `area` and `sub` are only checked by reading their source.
+    let fallbacks = schemata_fallbacks(&report);
+    assert_eq!(
+        fallbacks
+            .iter()
+            .map(|(name, _)| function(name))
+            .unique()
+            .sorted()
+            .collect_vec(),
+        ["area", "sub"],
+        "{fallbacks:?}"
+    );
+    for (name, reason) in &fallbacks {
+        assert_eq!(reason, "source_read_by_tests_missed_retest", "{name}");
+    }
+    assert_eq!(
+        report["fallback_time_by_reason"]["source_read_by_tests_missed_retest"]["count"],
+        fallbacks.len()
+    );
+    // Mutants in read files that the schema catches keep their schema outcome; missed
+    // mutants in other files are not tested again.
+    let tests = schemata_mutant_tests(&report);
+    let (read, unread): (Vec<_>, Vec<_>) =
+        tests.iter().partition(|(name, _, _)| in_read_file(name));
+    assert!(!read.is_empty());
+    for (name, summary, _) in &read {
+        assert_eq!(summary, "CaughtMutant", "{name}");
+    }
+    assert!(!unread.is_empty());
+    for (name, summary, _) in &unread {
+        assert_eq!(function(name), "double", "{name}");
+        assert_eq!(summary, "MissedMutant", "{name}");
+    }
+    assert_eq!(report["source_read_mutants"], read.len() + fallbacks.len());
+}
+
+#[test]
+fn schemata_tests_all_mutants_classically_when_baseline_fails_in_schemata_reads_source_at_runtime_tree()
+ {
+    // The test reads its source file from `file!()`, which can't be seen beforehand,
+    // so it fails with the schema: then every mutant is tested the classic way.
+    let report =
+        assert_schemata_outcomes_match_classic("schemata_reads_source_at_runtime", &[], &[]);
+    assert_eq!(
+        report["fallback_by_reason"],
+        json!({"schema_changes_behavior": 4})
+    );
+    assert_eq!(
+        report["fallback_time_by_reason"]["schema_changes_behavior"]["count"],
+        4
+    );
+    assert_eq!(report["mutant_tests"], json!([]));
+}
+
+#[test]
+fn schemata_tests_missed_mutants_classically_in_schemata_env_cleared_tree() {
+    // An integration test runs the binary with a cleared environment, so it runs the
+    // unmutated binary whatever the mutant: the binary's mutants look missed with the
+    // schema, and are tested again the classic way.
+    let report = assert_schemata_outcomes_match_classic("schemata_env_cleared", &[], &[]);
+    let executables = report["env_cleared_executables"].as_array().unwrap();
+    assert_eq!(executables.len(), 1);
+    assert!(
+        executables[0]
+            .as_str()
+            .unwrap()
+            .contains("cargo-mutants-testdata-schemata-env-cleared"),
+        "{executables:?}"
+    );
+    let fallbacks = schemata_fallbacks(&report);
+    assert_eq!(fallbacks.len(), 3, "{fallbacks:?}");
+    for (name, reason) in &fallbacks {
+        assert!(name.starts_with("src/main.rs"), "{name}");
+        assert_eq!(reason, "environment_cleared");
+    }
+    assert_eq!(
+        report["fallback_time_by_reason"]["environment_cleared"]["count"],
+        3
+    );
+    // The library's mutants run in a child process that inherits the environment,
+    // the test binary run again, which sees the mutant id.
+    let tests = schemata_mutant_tests(&report);
+    assert_eq!(tests.len(), 4);
+    for (name, summary, reached) in &tests {
+        assert!(name.starts_with("src/lib.rs"), "{name}");
+        assert_eq!(summary, "CaughtMutant", "{name}");
+        assert!(reached, "{name}");
+    }
+}
+
+#[test]
+fn schemata_detects_interfering_and_flaky_tests_in_schemata_interference_tree() {
+    let report = assert_schemata_outcomes_match_classic("schemata_interference", &["-j", "2"], &[]);
+    // Two copies of the tests at once in the shared build directory write the same
+    // file, so mutants are tested one at a time.
+    assert_eq!(report["concurrent_baseline_passed"], false);
+    assert_eq!(report["test_jobs"], 1);
+    // A test fails once for each mutant. The mutants of `untested` never run, so
+    // that failure can't be theirs, and they are tested again, and missed.
+    let tests = schemata_mutant_tests(&report);
+    for (name, summary, reached) in &tests {
+        assert_eq!(*reached, !name.contains("untested"), "{name}");
+        assert_eq!(
+            summary,
+            if *reached {
+                "CaughtMutant"
+            } else {
+                "MissedMutant"
+            },
+            "{name}"
+        );
+    }
+    assert_eq!(report["retested_unreached"], 4);
+}
+
+/// Without `--jobs`, the tests are run as several copies at once to choose how many
+/// mutants to test at once; if they interfere, mutants are tested one at a time.
+#[test]
+fn schemata_without_jobs_in_schemata_interference_tree_tests_one_mutant_at_a_time() {
+    if std::thread::available_parallelism().unwrap().get() < 4 {
+        // Only one copy is probed with fewer than 4 CPUs, so nothing is learned.
+        return;
+    }
+    let report = assert_schemata_outcomes_match_classic("schemata_interference", &[], &[]);
+    let probes = report["jobs_probe"].as_array().unwrap();
+    assert_eq!(probes.last().unwrap()["passed"], false);
+    assert_eq!(report["concurrent_baseline_passed"], false);
+    assert_eq!(report["test_jobs"], 1);
+}
+
+#[test]
+fn schemata_outcomes_match_classic_in_schemata_proc_macro_attrs_tree() {
+    let report = assert_schemata_outcomes_match_classic("schemata_proc_macro_attrs", &[], &[]);
+    // A macro that keeps the body's spans lets compile errors be blamed on single
+    // mutants, so the mutants in `sum` stay embedded.
+    let tests = schemata_mutant_tests(&report);
+    assert_eq!(
+        tests
+            .iter()
+            .filter(|(name, _, _)| name.contains(" in sum") || name.contains("replace sum"))
+            .count(),
+        4,
+        "{tests:?}"
+    );
+    // A macro that gives the body the attribute's span makes errors point outside
+    // any mutant, so every mutant in that file falls back; except that replacements
+    // of the value of `odds`, which returns `impl Trait`, are never embedded.
+    let respanned = schemata_fallbacks(&report)
+        .into_iter()
+        .filter(|(name, _)| name.starts_with("src/respanned.rs"))
+        .collect_vec();
+    assert_eq!(respanned.len(), 11, "{respanned:?}");
+    assert!(
+        respanned.iter().all(|(name, reason)| {
+            if name.contains("replace odds ->") {
+                reason == "impl_trait_return"
+            } else {
+                reason == "file_compile_error"
+            }
+        }),
+        "{respanned:?}"
+    );
+}
+
+#[test]
+fn schemata_outcomes_match_classic_in_schemata_no_std_tree() {
+    let report = assert_schemata_outcomes_match_classic("schemata_no_std", &[], &[]);
+    // Only functions are mutated, not the code in the `macro_rules!` definition.
+    assert_eq!(report["mutants"], 8);
+    assert_eq!(report["fallback"], 0);
+    // Unit tests and doctests.
+    assert_eq!(report["replay_commands"], 2);
+    for (name, summary, reached) in schemata_mutant_tests(&report) {
+        // Code disabled by a feature is never compiled, so its mutants are missed.
+        let disabled = name.contains("disabled");
+        assert_eq!(reached, !disabled, "{name}");
+        assert_eq!(
+            summary,
+            if disabled {
+                "MissedMutant"
+            } else {
+                "CaughtMutant"
+            },
+            "{name}"
+        );
+    }
+}
+
+// Experimental `--test-selection=coverage` ==============================================
+
+/// True if `llvm-profdata` and `llvm-cov` can be found as `--test-selection=coverage`
+/// looks for them: from `LLVM_PROFDATA` and `LLVM_COV`, or the `llvm-tools` rustup
+/// component of the toolchain that builds the testdata trees.
+///
+/// If not, says on stderr that `test` is skipped, and why. This bypasses the test
+/// harness's output capture, and `.config/nextest.toml` shows these tests' output
+/// even when they pass, so a skip is never silent.
+///
+/// In CI, that is when the `CI` environment variable is set, the tools are required,
+/// and their absence fails the test, unless
+/// `CARGO_MUTANTS_TESTS_ALLOW_MISSING_LLVM_TOOLS` is set, for CI platforms where
+/// rustup's llvm-tools aren't available.
+fn llvm_tools_available(test: &str) -> bool {
+    if env::var_os("LLVM_PROFDATA").is_some() && env::var_os("LLVM_COV").is_some() {
+        return true;
+    }
+    let rustc = |args: &[&str]| {
+        let output = std::process::Command::new("rustc")
+            .args(args)
+            .current_dir("testdata")
+            .output()
+            .unwrap();
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let version = rustc(&["-vV"]);
+    let host = version
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .unwrap();
+    let bin = Path::new(rustc(&["--print", "sysroot"]).trim())
+        .join("lib/rustlib")
+        .join(host)
+        .join("bin");
+    let available = ["llvm-profdata", "llvm-cov"].iter().all(|tool| {
+        bin.join(format!("{tool}{}", env::consts::EXE_SUFFIX))
+            .is_file()
+    });
+    if !available {
+        let is_set = |name| env::var_os(name).is_some_and(|value| !value.is_empty());
+        let reason = format!(
+            "llvm-profdata and llvm-cov not found in {}; \
+            install them with `rustup component add llvm-tools`, or set LLVM_PROFDATA and LLVM_COV",
+            bin.display()
+        );
+        assert!(
+            !is_set("CI") || is_set("CARGO_MUTANTS_TESTS_ALLOW_MISSING_LLVM_TOOLS"),
+            "{test} needs llvm-tools in CI: {reason}"
+        );
+        // Not `eprintln!`, which the test harness captures.
+        let message = format!("SKIPPED {test}: {reason}\n");
+        std::io::stderr().write_all(message.as_bytes()).unwrap();
+    }
+    available
+}
+
+/// The mutants of each plan in a `schemata.json` report, by plan name.
+fn mutants_by_plan(report: &serde_json::Value) -> std::collections::BTreeMap<String, Vec<String>> {
+    report["mutant_tests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| {
+            (
+                t["selection"]["plan"].as_str().unwrap().to_owned(),
+                t["name"].as_str().unwrap().to_owned(),
+            )
+        })
+        .into_group_map()
+        .into_iter()
+        .collect()
+}
+
+#[test]
+fn test_selection_coverage_outcomes_match_classic_in_test_selection_coverage_tree() {
+    if !llvm_tools_available(
+        "test_selection_coverage_outcomes_match_classic_in_test_selection_coverage_tree",
+    ) {
+        return;
+    }
+    // Confirming every mutant reported missed, including those no test executes,
+    // checks that none of them is actually caught by some test.
+    let report = assert_schemata_outcomes_match_classic_with(
+        "test_selection_coverage",
+        &[],
+        &["--test-selection=coverage"],
+        &[("CARGO_MUTANTS_COVERAGE_CONFIRM", "all")],
+    );
+    let selection = &report["test_selection"];
+    assert_eq!(selection["confirm"], "all");
+    // Three unit tests, one integration test, and the shout binary's unit test
+    // binary, which lists no tests and so is run as a whole.
+    assert_eq!(selection["collection"]["tests"], 5);
+    assert_eq!(selection["verdict_changes"], 0);
+    assert_eq!(selection["full_suite_reasons"], serde_json::json!({}));
+    let by_plan = mutants_by_plan(&report);
+    assert_eq!(by_plan.keys().collect_vec(), ["selected", "uncovered"]);
+    assert!(
+        by_plan["uncovered"]
+            .iter()
+            .all(|name| name.contains(" in untested") || name.contains("replace untested")),
+        "{by_plan:#?}"
+    );
+    // The shout binary's code only runs in a child process of an integration test.
+    assert!(
+        by_plan["selected"]
+            .iter()
+            .any(|name| name.starts_with("src/bin/shout.rs")),
+        "{by_plan:#?}"
+    );
+    // Of the two tests that execute `add`, only the fast one runs to catch it.
+    for test in report["mutant_tests"].as_array().unwrap() {
+        if test["name"].as_str().unwrap().contains("in add") {
+            assert_eq!(test["selection"]["selected_tests"], 2);
+            assert_eq!(test["selection"]["tests_run"], 1);
+            assert_eq!(test["summary"], "CaughtMutant");
+        }
+    }
+}
+
+#[test]
+fn test_selection_coverage_outcomes_match_classic_in_schemata_tree() {
+    if !llvm_tools_available("test_selection_coverage_outcomes_match_classic_in_schemata_tree") {
+        return;
+    }
+    let report = assert_schemata_outcomes_match_classic_with(
+        "schemata",
+        &["--minimum-test-timeout=5"],
+        &["--test-selection=coverage"],
+        &[],
+    );
+    let selection = &report["test_selection"];
+    assert_eq!(selection["confirm"], "reached");
+    assert_eq!(selection["verdict_changes"], 0);
+    // `scale` is only tested by a doctest, which isn't instrumented, so it's never
+    // reported missed without running the tests.
+    assert_eq!(selection["full_suite_reasons"]["doctests"], 4);
+    assert!(!mutants_by_plan(&report).contains_key("uncovered"));
+}
+
+#[test]
+fn test_selection_coverage_instrumented_code_runs_only_while_collecting_coverage() {
+    if !llvm_tools_available(
+        "test_selection_coverage_instrumented_code_runs_only_while_collecting_coverage",
+    ) {
+        return;
+    }
+    // The instrumented build shares the target directory with the schema build, and
+    // fallback build directories are seeded from it. Coverage collection gives every
+    // process it runs its own LLVM_PROFILE_FILE; any other instrumented process would
+    // write its profile to the one inherited from here.
+    let tmp = copy_of_testdata("test_selection_coverage");
+    let out = tempdir().unwrap();
+    let leaked = tempdir().unwrap();
+    run()
+        .env(
+            "LLVM_PROFILE_FILE",
+            leaked.path().join("%p.profraw").to_str().unwrap(),
+        )
+        .args([
+            "mutants",
+            "--no-times",
+            "--schemata",
+            "--test-selection=coverage",
+            "-j",
+            "2",
+            "-d",
+        ])
+        .arg(tmp.path())
+        .arg("-o")
+        .arg(out.path())
+        .timeout(std::time::Duration::from_secs(600))
+        .assert()
+        .code(2); // Some mutants are missed.
+    let report: serde_json::Value = read_to_string(out.path().join("mutants.out/schemata.json"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        report["test_selection"]["collection"]["tests"].as_u64() > Some(0),
+        "coverage was collected"
+    );
+    assert!(
+        report["fallback"].as_u64() >= Some(2),
+        "fallback mutants were built in seeded build directories"
+    );
+    let profiles = std::fs::read_dir(leaked.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect_vec();
+    assert!(
+        profiles.is_empty(),
+        "instrumented code ran after coverage collection: {profiles:?}"
+    );
+}
+
+/// Without llvm-tools for the tree's toolchain, the default coverage-based selection
+/// falls back to running all the tests, and says so once.
+///
+/// The toolchain is made to look as if it lacks llvm-tools by a `RUSTC` wrapper that
+/// reports an empty sysroot when asked for only that, as cargo-mutants does to find
+/// the tools, and otherwise runs rustc.
+#[test]
+#[cfg(unix)]
+fn test_selection_coverage_default_without_llvm_tools_runs_all_tests_saying_so_once() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = copy_of_testdata("small_well_tested");
+    let out = tempdir().unwrap();
+    let empty_sysroot = tempdir().unwrap();
+    let rustc = out.path().join("rustc-without-llvm-tools");
+    write(
+        &rustc,
+        format!(
+            "#!/bin/sh\n\
+            if [ $# -eq 2 ] && [ \"$1\" = --print ] && [ \"$2\" = sysroot ]; then\n\
+            echo '{}'; exit 0\n\
+            fi\n\
+            exec rustc \"$@\"\n",
+            empty_sysroot.path().display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&rustc, fs::Permissions::from_mode(0o755)).unwrap();
+    run()
+        .env("RUSTC", &rustc)
+        .env_remove("LLVM_PROFDATA")
+        .env_remove("LLVM_COV")
+        .args(["mutants", "--no-times", "-j1", "-d"])
+        .arg(tmp.path())
+        .arg("-o")
+        .arg(out.path())
+        .timeout(OUTER_TIMEOUT)
+        .assert()
+        .success()
+        .stderr(
+            " INFO Running all tests for each mutant: coverage-based test selection needs \
+            llvm-tools for this tree's toolchain (rustup component add llvm-tools)\n",
+        );
+    let report: serde_json::Value = read_to_string(out.path().join("mutants.out/schemata.json"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(report["test_selection"].is_null(), "{report:#}");
+    assert_eq!(report["mutant_tests"].as_array().unwrap().len(), 4);
+}
+
+#[test]
+fn test_selection_coverage_without_schemata_is_an_error() {
+    let tmp = copy_of_testdata("factorial");
+    run()
+        .args([
+            "mutants",
+            "--no-schemata",
+            "--test-selection=coverage",
+            "-d",
+        ])
+        .arg(tmp.path())
+        .assert()
+        .code(1)
+        .stderr(contains("--test-selection=coverage requires --schemata"));
+}
+
+// Coverage-based selection only reports missed what all the tests miss =================
+
+#[test]
+fn test_selection_coverage_outcomes_match_classic_in_test_selection_coverage_killed_child_tree() {
+    if !llvm_tools_available(
+        "test_selection_coverage_outcomes_match_classic_in_test_selection_coverage_killed_child_tree",
+    ) {
+        return;
+    }
+    let report = assert_schemata_outcomes_match_classic_with(
+        "test_selection_coverage_killed_child",
+        &[],
+        &["--test-selection=coverage"],
+        &[],
+    );
+    // The killed server writes no coverage, so no test seems to execute `triple`.
+    let by_plan = mutants_by_plan(&report);
+    assert_eq!(
+        by_plan["uncovered"]
+            .iter()
+            .filter(|name| name.contains("triple"))
+            .count(),
+        4,
+        "{by_plan:#?}"
+    );
+    // But the schema recorded that `triple` ran in the baseline, so all the tests run
+    // for its mutants; `untested` never ran, so all the tests would miss its mutants.
+    for test in report["mutant_tests"].as_array().unwrap() {
+        let name = test["name"].as_str().unwrap();
+        let selection = &test["selection"];
+        if name.contains("triple") || name.contains("untested") {
+            let ran = name.contains("triple");
+            assert_eq!(selection["plan"], "uncovered", "{name}");
+            assert_eq!(selection["ran_in_baseline"], ran, "{name}");
+            assert_eq!(selection["confirmed"], ran, "{name}");
+        }
+    }
+    assert_eq!(report["test_selection"]["confirm"], "reached");
+    assert_eq!(report["test_selection"]["confirmations"], 4);
+}
+
+#[test]
+fn test_selection_coverage_outcomes_match_classic_in_test_selection_coverage_timeout_tree() {
+    if !llvm_tools_available(
+        "test_selection_coverage_outcomes_match_classic_in_test_selection_coverage_timeout_tree",
+    ) {
+        return;
+    }
+    let report = assert_schemata_outcomes_match_classic_with(
+        "test_selection_coverage_timeout",
+        &["--timeout=5"],
+        &["--test-selection=coverage"],
+        &[],
+    );
+    let step_0 = report["mutant_tests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "src/lib.rs:4:5: replace step -> u32 with 0")
+        .expect("mutant tested with the schema");
+    // The fastest selected test hangs alone; then the slower one, which the full suite
+    // runs at the same time, runs and fails.
+    assert_eq!(step_0["summary"], "CaughtMutant");
+    assert_eq!(step_0["selection"]["selected_tests"], 2);
+    assert_eq!(step_0["selection"]["tests_run"], 2);
+}
+
+#[test]
+fn shuffle_makes_schemata_test_nested_mod_mutants_in_random_order() {
+    let tmp = copy_of_testdata("nested_mod");
+    let listed = run()
+        .args(["mutants", "--list", "-d"])
+        .arg(tmp.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let listed = String::from_utf8(listed)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect_vec();
+    let out = tempdir().unwrap();
+    run()
+        .args([
+            "mutants",
+            "--no-times",
+            "--schemata",
+            "--test-selection=all",
+            "--shuffle",
+            "-j1",
+            "-d",
+        ])
+        .arg(tmp.path())
+        .arg("-o")
+        .arg(out.path())
+        .timeout(OUTER_TIMEOUT)
+        .output()
+        .unwrap();
+    let outcomes: serde_json::Value = read_to_string(out.path().join("mutants.out/outcomes.json"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let tested = outcomes["outcomes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|outcome| outcome["scenario"]["Mutant"]["name"].as_str())
+        .map(str::to_owned)
+        .collect_vec();
+    // With 19 mutants, a shuffle keeps their order once in 19! runs.
+    assert_eq!(listed.len(), 19);
+    assert_eq!(
+        tested.iter().sorted().collect_vec(),
+        listed.iter().sorted().collect_vec()
+    );
+    assert_ne!(tested, listed);
+}
+
+#[test]
+fn schemata_records_no_unviable_mutants_when_struct_with_no_default_tree_fails_its_tests() {
+    // Its mutant that returns `Default::default()` is proven unviable by the schema's
+    // compile errors, but like the classic way, nothing is recorded for any mutant
+    // if the tests fail in the unmutated tree: whether other mutants are embedded in
+    // the schema, or none are.
+    for embedded in ["pub fn two() -> u32 {\n    2\n}\n", ""] {
+        let tmp = copy_of_testdata("struct_with_no_default");
+        let lib = tmp.path().join("src/lib.rs");
+        let mut code = read_to_string(&lib).unwrap();
+        code.push_str("\n#[test]\nfn fails_unmutated() {\n    panic!(\"fails\");\n}\n");
+        code.push_str(embedded);
+        write(&lib, code).unwrap();
+        let out = tempdir().unwrap();
+        run()
+            .args(["mutants", "--no-times", "--schemata", "-d"])
+            .arg(tmp.path())
+            .arg("-o")
+            .arg(out.path())
+            .timeout(OUTER_TIMEOUT)
+            .assert()
+            .code(4);
+        let mutants_out = out.path().join("mutants.out");
+        let report: serde_json::Value = read_to_string(mutants_out.join("schemata.json"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(report["proven_unviable"], 1, "{report:#}");
+        assert_eq!(
+            mutant_summaries(&mutants_out),
+            std::collections::BTreeMap::new(),
+            "{embedded:?}"
+        );
+    }
+}
+
+/// A test runner that runs each test binary as a sandbox might, without the mutant
+/// id in its environment and unable to write to the schema's marker directory,
+/// which is in `$TMPDIR`.
+#[cfg(unix)]
+const SANDBOX_RUNNER: &str = "#!/bin/sh\n\
+    chmod a-w \"$TMPDIR\"/cargo-mutants-schemata-markers-* 2>/dev/null\n\
+    unset CARGO_MUTANTS_SCHEMATA_ID\n\
+    exec \"$@\"\n";
+
+#[test]
+#[cfg(unix)]
+fn schemata_outcomes_match_classic_in_small_well_tested_tree_when_test_runner_hides_mutant_id_and_markers()
+ {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempdir().unwrap();
+    let runner = dir.path().join("sandbox-runner");
+    write(&runner, SANDBOX_RUNNER).unwrap();
+    fs::set_permissions(&runner, fs::Permissions::from_mode(0o755)).unwrap();
+    let version = std::process::Command::new("rustc")
+        .arg("-vV")
+        .current_dir("testdata")
+        .output()
+        .unwrap()
+        .stdout;
+    let host = String::from_utf8(version)
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("host: ").map(str::to_owned))
+        .unwrap();
+    let runner_var = format!(
+        "CARGO_TARGET_{}_RUNNER",
+        host.to_uppercase().replace(['-', '.'], "_")
+    );
+    // The marker directory is made in $TMPDIR, so this run gets its own.
+    let tmpdir = dir.path().join("tmp");
+    fs::create_dir(&tmpdir).unwrap();
+    let report = assert_schemata_outcomes_match_classic(
+        "small_well_tested",
+        &[],
+        &[
+            (runner_var.as_str(), runner.to_str().unwrap()),
+            ("TMPDIR", tmpdir.to_str().unwrap()),
+        ],
+    );
+    // No test process recorded that it saw the mutant id, so every mutant is tested
+    // the classic way.
+    assert!(report["mutant_tests"].as_array().unwrap().is_empty());
+    assert_eq!(
+        report["fallback_by_reason"],
+        serde_json::json!({"markers_not_recorded": report["mutants"]})
+    );
+}
+
+#[test]
+fn test_selection_coverage_outcomes_match_classic_in_test_selection_coverage_fails_alone_tree() {
+    if !llvm_tools_available(
+        "test_selection_coverage_outcomes_match_classic_in_test_selection_coverage_fails_alone_tree",
+    ) {
+        return;
+    }
+    let report = assert_schemata_outcomes_match_classic_with(
+        "test_selection_coverage_fails_alone",
+        &[],
+        &["--test-selection=coverage"],
+        &[],
+    );
+    let selection = &report["test_selection"];
+    assert_eq!(
+        selection["collection"]["isolated_results"],
+        serde_json::json!({"passed": 1, "failed": 1})
+    );
+    // The test that fails alone stops before it executes `quadruple`, so its profile
+    // can't show that `quadruple` is unexecuted: all the tests run for its mutants.
+    assert_eq!(
+        selection["full_suite_reasons"],
+        serde_json::json!({"incomplete_profiles": 4})
+    );
+    assert!(!mutants_by_plan(&report).contains_key("uncovered"));
+}
+
+// Stopping tests at the first failure ================================================
+
+/// Run cargo-mutants on a copy of the `fail_fast` tree, testing only the mutant that
+/// makes the fast test fail and the slow test sleep, and return its log.
+fn fail_fast_mutant_log(args: &[&str], env: &[(&str, &str)]) -> String {
+    let tmp = copy_of_testdata("fail_fast");
+    let out = tempdir().unwrap();
+    run()
+        .envs(env.iter().copied())
+        .args(["mutants", "--no-times", "--no-shuffle", "-d"])
+        .arg(tmp.path())
+        .arg("-o")
+        .arg(out.path())
+        .args(["--re", "is_answer -> bool with false"])
+        .args(args)
+        .timeout(std::time::Duration::from_secs(300))
+        .assert()
+        .success();
+    let mutants_out = out.path().join("mutants.out");
+    assert_eq!(
+        mutant_summaries(&mutants_out).into_values().collect_vec(),
+        ["CaughtMutant"]
+    );
+    let outcomes: serde_json::Value = read_to_string(mutants_out.join("outcomes.json"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let log_path = outcomes["outcomes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|outcome| outcome["scenario"] != "Baseline")
+        .expect("mutant outcome")["log_path"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let log = read_to_string(mutants_out.join(log_path))
+        .unwrap()
+        .replace('\r', "");
+    println!("mutant log:\n{log}");
+    log
+}
+
+/// The log shows the first failure stopped the tests before the slow test finished,
+/// and gives a command that reruns just that mutant without stopping its tests.
+fn assert_fail_fast_log_stopped_at_first_failure(log: &str) {
+    assert!(log.contains("test test::fast_test_fails_when_mutated ... FAILED"));
+    assert!(!log.contains("test test::slow_test_passes_when_mutated ... ok"));
+    let stopped = log
+        .lines()
+        .find(|line| line.starts_with("*** stopped tests: "))
+        .expect("stopped tests line");
+    let command = stopped
+        .strip_prefix(
+            "*** stopped tests: test::fast_test_fails_when_mutated failed; \
+            rerun this mutant with complete output: ",
+        )
+        .unwrap_or_else(|| panic!("unexpected stopped tests line: {stopped}"));
+    // The fail_fast tree's mutant names need no shell escaping beyond the quotes.
+    let (name_re, rest) = command
+        .strip_prefix("cargo mutants --re '")
+        .and_then(|re| re.split_once("' "))
+        .unwrap_or_else(|| panic!("command starts with a quoted --re: {command}"));
+    assert!(
+        rest.starts_with("--stop-tests-on-failure=false -o "),
+        "{command}"
+    );
+    assert!(
+        rest.contains(" --dir="),
+        "the run was given -d, so the rerun is too: {command}"
+    );
+    let tmp = copy_of_testdata("fail_fast");
+    let listed = run()
+        .args(["mutants", "--list", "--re", name_re, "-d"])
+        .arg(tmp.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(
+        String::from_utf8(listed).unwrap(),
+        "src/lib.rs:9:5: replace is_answer -> bool with false\n"
+    );
+}
+
+#[test]
+fn stop_tests_on_failure_stops_cargo_test_of_fail_fast_before_slow_test_passes() {
+    let log = fail_fast_mutant_log(&["--no-schemata"], &[]);
+    if cfg!(windows) {
+        // Killing cargo on Windows would leave the test binary running, so tests aren't stopped.
+        assert!(log.contains("test test::slow_test_passes_when_mutated ... ok"));
+    } else {
+        assert_fail_fast_log_stopped_at_first_failure(&log);
+    }
+}
+
+#[test]
+fn stop_tests_on_failure_stops_schemata_replay_of_fail_fast_before_slow_test_passes() {
+    // Coverage-based selection would run the fast test alone, which exits by itself.
+    let log = fail_fast_mutant_log(&["--schemata", "--test-selection=all"], &[]);
+    assert_fail_fast_log_stopped_at_first_failure(&log);
+}
+
+#[test]
+fn stop_tests_on_failure_false_lets_fail_fast_slow_test_finish() {
+    let log = fail_fast_mutant_log(
+        &["--stop-tests-on-failure=false", "--test-selection=all"],
+        &[],
+    );
+    assert!(log.contains("test test::slow_test_passes_when_mutated ... ok"));
+    assert!(log.contains("---- test::fast_test_fails_when_mutated stdout ----"));
+    assert!(!log.contains("*** stopped tests"));
+}
+
+#[test]
+#[cfg(unix)] // Killing cargo on Windows would leave the test binary running, so tests aren't stopped.
+fn stop_tests_on_failure_stops_schemata_cargo_test_of_fail_fast_before_slow_test_passes() {
+    let log = fail_fast_mutant_log(&["--schemata"], &[("CARGO_MUTANTS_SCHEMATA_EXEC", "cargo")]);
+    assert_fail_fast_log_stopped_at_first_failure(&log);
+}
+
+// Rerunning a stopped mutant, validating options, and build dirs =======================
+
+/// The command that the log of a stopped mutant gives to rerun it, which the test can
+/// run with a POSIX shell once `cargo mutants` is replaced by the binary under test.
+#[cfg(unix)]
+fn rerun_command_in_log(log: &str) -> String {
+    let (_, command) = log
+        .lines()
+        .find_map(|line| line.split_once("rerun this mutant with complete output: "))
+        .expect("rerun command in log");
+    let rest = command
+        .strip_prefix("cargo mutants ")
+        .unwrap_or_else(|| panic!("command runs cargo mutants: {command}"));
+    format!(
+        "'{}' mutants {rest}",
+        integration_util::main_binary().display()
+    )
+}
+
+/// The rerun command in a stopped mutant's log repeats the run's options, including
+/// cargo and test arguments, tests only that mutant with its tests not stopped, and
+/// writes its output without rotating the run's `mutants.out`.
+#[test]
+#[cfg(unix)] // Killing cargo on Windows would leave the test binary running, so tests aren't stopped.
+fn stop_tests_on_failure_rerun_command_repeats_options_and_keeps_the_run_output() {
+    let tmp = copy_of_testdata("fail_fast");
+    let out = tempdir().unwrap();
+    let options = [
+        "--no-schemata",
+        "--cargo-test-arg=--lib",
+        "--timeout=300",
+        "--",
+        "--",
+        "--test-threads=1",
+    ];
+    run()
+        .args(["mutants", "--no-times", "-j2", "-d"])
+        .arg(tmp.path())
+        .arg("-o")
+        .arg(out.path())
+        .args(["--re", "is_answer -> bool with false"])
+        .args(options)
+        .timeout(OUTER_TIMEOUT)
+        .assert()
+        .success();
+    let mutants_out = out.path().join("mutants.out");
+    let run_outcomes = read_to_string(mutants_out.join("outcomes.json")).unwrap();
+    let (_, log_path) = outcome_log_paths(&mutants_out)
+        .into_iter()
+        .find(|(name, _)| name != "baseline")
+        .expect("mutant log");
+    let log = read_to_string(mutants_out.join(log_path)).unwrap();
+    assert!(log.contains("*** stopped tests: "), "{log}");
+
+    let command = rerun_command_in_log(&log);
+    println!("rerun: {command}");
+    let mut shell = assert_cmd::Command::new("sh");
+    for (name, _) in env::vars().filter(|(name, _)| name.starts_with("CARGO_MUTANTS_")) {
+        shell.env_remove(name);
+    }
+    shell
+        .args(["-c", &command])
+        .timeout(OUTER_TIMEOUT)
+        .assert()
+        .success();
+
+    assert_eq!(
+        read_to_string(mutants_out.join("outcomes.json")).unwrap(),
+        run_outcomes
+    );
+    assert!(!out.path().join("mutants.out.old").exists());
+    let rerun_out = mutants_out.join("rerun/mutants.out");
+    assert_eq!(
+        mutant_summaries(&rerun_out).into_values().collect_vec(),
+        ["CaughtMutant"]
+    );
+    let (_, rerun_log_path) = outcome_log_paths(&rerun_out)
+        .into_iter()
+        .find(|(name, _)| name != "baseline")
+        .expect("rerun mutant log");
+    let rerun_log = read_to_string(rerun_out.join(rerun_log_path)).unwrap();
+    assert!(!rerun_log.contains("*** stopped tests"), "{rerun_log}");
+    assert!(rerun_log.contains("test test::slow_test_passes_when_mutated ... ok"));
+    let cargo_test = rerun_log
+        .lines()
+        .find(|line| {
+            line.starts_with("*** ") && line.contains(" test ") && !line.contains("--no-run")
+        })
+        .expect("cargo test command");
+    assert!(
+        cargo_test.ends_with(" --lib -- --test-threads=1"),
+        "{cargo_test}"
+    );
+}
+
+/// The name and log path of each outcome in `mutants_out/outcomes.json`, with the
+/// baseline named `baseline`.
+#[cfg(unix)]
+fn outcome_log_paths(mutants_out: &Path) -> Vec<(String, String)> {
+    let outcomes: serde_json::Value = read_to_string(mutants_out.join("outcomes.json"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    outcomes["outcomes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|outcome| {
+            let name = outcome["scenario"]["Mutant"]["name"]
+                .as_str()
+                .unwrap_or("baseline");
+            (
+                name.to_owned(),
+                outcome["log_path"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect()
+}
+
+/// Run cargo-mutants on a copy of `factorial` that has a `mutants.out` from an earlier
+/// run, with `args` that it rejects, and check that the earlier `mutants.out` is left
+/// where it was, as it was.
+fn assert_rejected_args_leave_mutants_out_untouched(
+    args: &[&str],
+    env: &[(&str, &Path)],
+    error: &str,
+) {
+    let tmp = copy_of_testdata("factorial");
+    let earlier = tmp.path().join("mutants.out");
+    create_dir(&earlier).unwrap();
+    write(earlier.join("outcomes.json"), "earlier").unwrap();
+    run()
+        .envs(env.iter().copied())
+        .args(["mutants", "-d"])
+        .arg(tmp.path())
+        .args(args)
+        .timeout(OUTER_TIMEOUT)
+        .assert()
+        .code(1)
+        .stderr(contains(error));
+    assert_eq!(
+        read_to_string(earlier.join("outcomes.json")).unwrap(),
+        "earlier"
+    );
+    assert!(!tmp.path().join("mutants.out.old").exists());
+}
+
+#[test]
+fn schemata_with_in_place_is_rejected_before_rotating_mutants_out() {
+    assert_rejected_args_leave_mutants_out_untouched(
+        &["--schemata", "--in-place"],
+        &[],
+        "--schemata can't be used with --in-place",
+    );
+}
+
+#[test]
+fn test_selection_coverage_with_no_schemata_is_rejected_before_rotating_mutants_out() {
+    assert_rejected_args_leave_mutants_out_untouched(
+        &["--no-schemata", "--test-selection=coverage"],
+        &[],
+        "--test-selection=coverage requires --schemata",
+    );
+}
+
+/// The toolchain is made to look as if it lacks llvm-tools as in
+/// `test_selection_coverage_default_without_llvm_tools_runs_all_tests_saying_so_once`.
+#[test]
+#[cfg(unix)]
+fn test_selection_coverage_without_llvm_tools_is_rejected_before_rotating_mutants_out() {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = tempdir().unwrap();
+    let rustc = bin.path().join("rustc-without-llvm-tools");
+    write(
+        &rustc,
+        format!(
+            "#!/bin/sh\n\
+            if [ $# -eq 2 ] && [ \"$1\" = --print ] && [ \"$2\" = sysroot ]; then\n\
+            echo '{}'; exit 0\n\
+            fi\n\
+            exec rustc \"$@\"\n",
+            bin.path().display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&rustc, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_rejected_args_leave_mutants_out_untouched(
+        &["--test-selection=coverage"],
+        &[("RUSTC", &rustc)],
+        "--test-selection=coverage needs llvm-profdata and llvm-cov",
+    );
+}
+
+/// With `CARGO_TARGET_DIR` set in the environment, as a user might set it to share one
+/// target dir between projects, each build dir still builds into its own `target/`, so
+/// that concurrent jobs don't use each other's mutated build products.
+#[test]
+fn cargo_target_dir_from_environment_is_not_shared_by_build_dirs() {
+    let shared_target = tempdir().unwrap();
+    let summaries = |cargo_target_dir: Option<&Path>| {
+        let tmp = copy_of_testdata("small_well_tested");
+        let out = tempdir().unwrap();
+        let mut command = run();
+        match cargo_target_dir {
+            Some(dir) => command.env("CARGO_TARGET_DIR", dir),
+            None => command.env_remove("CARGO_TARGET_DIR"),
+        };
+        command
+            .args(["mutants", "--no-times", "--no-schemata", "-j2", "-d"])
+            .arg(tmp.path())
+            .arg("-o")
+            .arg(out.path())
+            .timeout(OUTER_TIMEOUT)
+            .assert()
+            .success();
+        mutant_summaries(&out.path().join("mutants.out"))
+    };
+    let expected = summaries(None);
+    assert!(expected.len() > 1, "{expected:?}");
+    assert_eq!(summaries(Some(shared_target.path())), expected);
+    assert_eq!(
+        read_dir(shared_target.path()).unwrap().count(),
+        0,
+        "nothing is built in the shared target dir"
+    );
+}
+
+#[test]
+fn cargo_target_dir_from_environment_is_not_used_by_schemata_build() {
+    let shared_target = tempdir().unwrap();
+    let tmp = copy_of_testdata("small_well_tested");
+    let out = tempdir().unwrap();
+    run()
+        .env("CARGO_TARGET_DIR", shared_target.path())
+        .args(["mutants", "--no-times", "--schemata", "-d"])
+        .arg(tmp.path())
+        .arg("-o")
+        .arg(out.path())
+        .timeout(OUTER_TIMEOUT)
+        .assert()
+        .success();
+    assert_eq!(
+        read_dir(shared_target.path()).unwrap().count(),
+        0,
+        "nothing is built in the shared target dir"
+    );
 }

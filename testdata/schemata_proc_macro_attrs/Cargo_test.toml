@@ -1,0 +1,23 @@
+# A tree whose functions are transformed by attribute macros from a local
+# proc-macro crate, like `#[tracing::instrument]` or `#[async_trait]`, to check
+# how `cargo mutants --schemata` embeds mutants in them.
+#
+# `#[in_closure]` moves the body into a closure, keeping its spans, so compile
+# errors in the schema are blamed on the right mutant. `#[respan]` gives every
+# token of the body the attribute's span, so errors point at the attribute, and
+# all the mutants in that file are tested the classic way.
+
+[package]
+name = "cargo-mutants-testdata-schemata-proc-macro-attrs"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+doctest = false
+
+[dependencies]
+macros = { path = "macros" }
+
+[workspace]
+members = [".", "macros"]

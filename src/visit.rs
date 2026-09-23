@@ -27,7 +27,7 @@ use tracing::{debug_span, error, info, trace, trace_span, warn};
 
 use crate::console::WalkProgress;
 use crate::fnvalue::return_type_replacements;
-use crate::mutant::{Function, MutationTarget};
+use crate::mutant::{EnclosingSyntax, Function, MutationTarget};
 use crate::package::Package;
 use crate::pretty::ToPrettyString;
 use crate::source::SourceFile;
@@ -427,12 +427,15 @@ impl DiscoveryVisitor<'_> {
     }
 
     /// Record that we generated some mutants.
+    ///
+    /// `enclosing` gives any extra syntax locations needed by the schemata generator.
     fn collect_mutant(
         &mut self,
         span: Span,
         short_replaced: Option<String>,
         replacement: &TokenStream,
         genre: Genre,
+        enclosing: Option<EnclosingSyntax>,
     ) {
         let mutant = Mutant::new_discovered(
             self.source_file.clone(),
@@ -442,7 +445,8 @@ impl DiscoveryVisitor<'_> {
             replacement.to_pretty_string(),
             genre,
             None,
-        );
+        )
+        .with_enclosing(enclosing);
         if self.excluded_by_attr_re(&mutant.name) {
             trace!(
                 name = mutant.name(false),
@@ -481,7 +485,7 @@ impl DiscoveryVisitor<'_> {
                     if orig_block == new_block {
                         trace!("Replacement is the same as the function body; skipping");
                     } else {
-                        self.collect_mutant(body_span, None, &rep, Genre::FnValue);
+                        self.collect_mutant(body_span, None, &rep, Genre::FnValue, None);
                     }
                 }
             }
@@ -832,8 +836,15 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
                 Vec::new()
             }
         };
+        let enclosing = Some(EnclosingSyntax::BinaryExpr(i.span().into()));
         for rep in replacements {
-            self.collect_mutant(i.op.span().into(), None, &rep, Genre::BinaryOperator);
+            self.collect_mutant(
+                i.op.span().into(),
+                None,
+                &rep,
+                Genre::BinaryOperator,
+                enclosing,
+            );
         }
         syn::visit::visit_expr_binary(self, i);
     }
@@ -847,7 +858,13 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
         self.in_exclude_re_scope(&i.attrs, |v| {
             match i.op {
                 UnOp::Not(_) | UnOp::Neg(_) => {
-                    v.collect_mutant(i.op.span().into(), None, &quote! {}, Genre::UnaryOperator);
+                    v.collect_mutant(
+                        i.op.span().into(),
+                        None,
+                        &quote! {},
+                        Genre::UnaryOperator,
+                        Some(EnclosingSyntax::UnaryExpr(i.span().into())),
+                    );
                 }
                 _ => {
                     trace!(
@@ -892,6 +909,10 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
                         Some(arm.pat.to_pretty_string()),
                         &replacement,
                         Genre::MatchArm,
+                        Some(EnclosingSyntax::MatchArm {
+                            pat: arm.pat.span().into(),
+                            guard: arm.guard.as_ref().map(|(_if, guard)| guard.span().into()),
+                        }),
                     );
                 }
             } else {
@@ -907,12 +928,14 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
                         None,
                         &quote! { true },
                         Genre::MatchArmGuard,
+                        None,
                     );
                     v.collect_mutant(
                         guard_expr.span().into(),
                         None,
                         &quote! { false },
                         Genre::MatchArmGuard,
+                        None,
                     );
                 });
 
@@ -2369,6 +2392,99 @@ mod test {
                 .iter()
                 .any(|n| n.contains("add") && n.contains("-> i32")),
             "should still contain add fn-value mutant: {names:?}"
+        );
+    }
+
+    /// Return (original text, enclosing text) for mutants of the given genre.
+    fn enclosing_texts(code: &str, genre: &Genre) -> Vec<(String, String)> {
+        mutate_source_str(code, &Options::default())
+            .unwrap()
+            .into_iter()
+            .filter(|m| &m.genre == genre)
+            .map(|m| {
+                let enclosing = match m.enclosing {
+                    Some(EnclosingSyntax::BinaryExpr(span) | EnclosingSyntax::UnaryExpr(span)) => {
+                        span.extract(code)
+                    }
+                    Some(EnclosingSyntax::MatchArm { pat, guard }) => format!(
+                        "{} / {}",
+                        pat.extract(code),
+                        guard.map(|g| g.extract(code)).unwrap_or_default()
+                    ),
+                    None => String::new(),
+                };
+                (m.original_text(), enclosing)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn visit_expr_binary_records_enclosing_binary_expression() {
+        let code = "fn f(a: i32, b: i32, c: i32) -> i32 {\n    a + b * c\n}\n";
+        assert_eq!(
+            enclosing_texts(code, &Genre::BinaryOperator),
+            [
+                ("+".to_owned(), "a + b * c".to_owned()),
+                ("+".to_owned(), "a + b * c".to_owned()),
+                ("*".to_owned(), "b * c".to_owned()),
+                ("*".to_owned(), "b * c".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn visit_expr_binary_records_enclosing_compound_assignment() {
+        let code = "fn f(mut a: i32) -> i32 {\n    a += 2;\n    a\n}\n";
+        assert_eq!(
+            enclosing_texts(code, &Genre::BinaryOperator),
+            [
+                ("+=".to_owned(), "a += 2".to_owned()),
+                ("+=".to_owned(), "a += 2".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn visit_expr_unary_records_enclosing_unary_expression() {
+        let code = "fn f(a: bool) -> bool {\n    !a.is_positive()\n}\n";
+        assert_eq!(
+            enclosing_texts(code, &Genre::UnaryOperator),
+            [("!".to_owned(), "!a.is_positive()".to_owned())]
+        );
+    }
+
+    #[test]
+    fn visit_expr_match_records_match_arm_pattern_and_no_guard() {
+        let code = indoc! {"
+            fn f(x: u32) -> u32 {
+                match x {
+                    1 | 2 => 3,
+                    _ => 4,
+                }
+            }
+        "};
+        assert_eq!(
+            enclosing_texts(code, &Genre::MatchArm),
+            [("1 | 2 => 3,".to_owned(), "1 | 2 / ".to_owned())]
+        );
+    }
+
+    #[test]
+    fn fn_value_and_match_arm_guard_mutants_have_no_enclosing_syntax() {
+        let code = indoc! {"
+            fn f(x: u32) -> u32 {
+                match x {
+                    1 if x > 0 => 3,
+                    _ => 4,
+                }
+            }
+        "};
+        let mutants = mutate_source_str(code, &Options::default()).unwrap();
+        assert!(
+            mutants
+                .iter()
+                .filter(|m| matches!(m.genre, Genre::FnValue | Genre::MatchArmGuard))
+                .all(|m| m.enclosing.is_none())
         );
     }
 }

@@ -1,0 +1,14 @@
+# A `#![no_std]` library in the 2015 edition, which the schema's helper module
+# must work in, with a doctest, which builds the library as a dependency of the
+# doctest; code in a `macro_rules!` definition, which isn't mutated; and code
+# disabled by a feature, whose mutants are missed both with and without
+# `--schemata`.
+
+[package]
+name = "cargo-mutants-testdata-schemata-no-std"
+version = "0.0.0"
+edition = "2015"
+publish = false
+
+[features]
+never = []

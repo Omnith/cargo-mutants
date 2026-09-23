@@ -1,0 +1,18 @@
+# A tree exercising every mutant genre, and code that can't be embedded in a
+# mutant schema, to check that `cargo mutants --schemata` gives the same outcome
+# as classic mutation testing for every embedded mutant.
+#
+# It includes caught and missed mutants, mutants that never terminate, a
+# function tested only by a doctest, and a test target that runs no tests.
+#
+# The description has several lines, which cargo prints literally in the test
+# commands that `--schemata` replays.
+
+[package]
+name = "cargo-mutants-testdata-schemata"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = """
+Every mutant genre,
+for `--schemata`."""

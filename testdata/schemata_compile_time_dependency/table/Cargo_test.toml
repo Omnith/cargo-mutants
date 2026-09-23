@@ -1,0 +1,10 @@
+# A library used only by a build script, so its code runs at compile time.
+
+[package]
+name = "table"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+doctest = false

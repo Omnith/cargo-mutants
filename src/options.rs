@@ -53,8 +53,14 @@ pub struct Options {
     /// Don't copy files matching gitignore patterns to build directories.
     pub gitignore: bool,
 
+    /// Kill the tests for a mutant once the test harness reports a failed test.
+    pub stop_tests_on_failure: bool,
+
     /// Copy the /target directory to build directories.
     pub copy_target: bool,
+
+    /// Seed the target directory of extra parallel build directories from the baseline build.
+    pub seed_target: bool,
 
     /// Don't copy at all; run tests in the source directory.
     pub in_place: bool,
@@ -162,6 +168,40 @@ pub struct Options {
     pub emit_json: bool,
 
     pub common: Common,
+
+    /// Embed mutants into one schema built once, selecting each at runtime.
+    pub schemata: Choice<bool>,
+
+    /// Which tests run for each mutant, with a schema.
+    pub test_selection: Choice<TestSelection>,
+}
+
+/// The value of an option that cargo-mutants might not be able to honor, and whether
+/// it came from the command line.
+///
+/// If a value from the command line can't be honored, that's an error; a default or
+/// configured value falls back to one that works, with a message saying why.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Choice<T> {
+    pub value: T,
+    pub on_command_line: bool,
+}
+
+impl<T> Choice<T> {
+    /// The value from the command line if given, or else from the config, or else
+    /// `default`.
+    fn resolve(command_line: Option<T>, config: Option<T>, default: T) -> Choice<T> {
+        match command_line {
+            Some(value) => Choice {
+                value,
+                on_command_line: true,
+            },
+            None => Choice {
+                value: config.unwrap_or(default),
+                on_command_line: false,
+            },
+        }
+    }
 }
 
 // Options that are implemented only once between clap and serde.
@@ -235,6 +275,21 @@ pub enum TestTool {
 /// Join two slices into a new vector.
 fn join_slices(a: &[String], b: &[String]) -> Vec<String> {
     a.iter().chain(b).cloned().collect()
+}
+
+/// Which tests run for each mutant.
+#[derive(
+    Debug, Default, Clone, Copy, PartialEq, Eq, Display, ValueEnum, Deserialize, JsonSchema,
+)]
+#[strum(serialize_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum TestSelection {
+    /// All the tests.
+    #[default]
+    All,
+    /// With schemata: only the tests that execute the mutated code, according to
+    /// coverage collected from the unmutated tree.
+    Coverage,
 }
 
 /// Should ANSI colors be drawn?
@@ -361,6 +416,7 @@ impl Options {
                 .unwrap_or(config.gitignore.unwrap_or_default()),
             copy_target: (!args.no_copy_target)
                 && args.copy_target.or(config.copy_target).unwrap_or(false),
+            seed_target: args.seed_target.or(config.seed_target).unwrap_or(true),
             in_place: args.in_place,
             jobs: args.jobs,
             jobserver: args.jobserver,
@@ -381,9 +437,27 @@ impl Options {
             show_times: !args.no_times,
             show_all_logs: args.all_logs,
             skip_calls,
+            stop_tests_on_failure: args
+                .stop_tests_on_failure
+                .or(config.stop_tests_on_failure)
+                .unwrap_or(true),
             test_package,
             test_timeout: args.timeout.map(Duration::from_secs_f64),
             test_timeout_multiplier: args.timeout_multiplier.or(config.timeout_multiplier),
+            schemata: Choice::resolve(
+                if args.no_schemata {
+                    Some(false)
+                } else {
+                    args.schemata
+                },
+                config.schemata,
+                true,
+            ),
+            test_selection: Choice::resolve(
+                args.test_selection,
+                config.test_selection,
+                TestSelection::Coverage,
+            ),
         };
         if let Some(jobs) = options.jobs
             && jobs > 8
@@ -731,6 +805,24 @@ mod test {
     }
 
     #[test]
+    fn stop_tests_on_failure_on_by_default() {
+        let args = Args::parse_from(["mutants"]);
+        let config = Config::from_str("").unwrap();
+        let options = Options::new(&args, &config).unwrap();
+        assert!(options.stop_tests_on_failure);
+    }
+
+    #[test]
+    fn stop_tests_on_failure_false_in_config_is_overridden_by_command_line() {
+        let config = Config::from_str("stop_tests_on_failure = false").unwrap();
+        let options = Options::new(&Args::parse_from(["mutants"]), &config).unwrap();
+        assert!(!options.stop_tests_on_failure);
+        let args = Args::parse_from(["mutants", "--stop-tests-on-failure=true"]);
+        let options = Options::new(&args, &config).unwrap();
+        assert!(options.stop_tests_on_failure);
+    }
+
+    #[test]
     fn gitignore_off_by_default() {
         let args = Args::parse_from(["mutants"]);
         let config = Config::from_str("").unwrap();
@@ -868,6 +960,124 @@ mod test {
         let args = Args::parse_from(["mutants", "--copy-target=true"]);
         let config = Config::from_str("copy_target = false ").unwrap();
         let options = Options::new(&args, &config).unwrap();
+        assert!(options.copy_target);
+    }
+
+    #[test]
+    fn seed_target_default_true() {
+        let args = Args::parse_from(["mutants"]);
+        let options = Options::new(&args, &Config::default()).unwrap();
+        assert!(options.seed_target);
+    }
+
+    #[test]
+    fn seed_target_false_from_command_line() {
+        let args = Args::parse_from(["mutants", "--seed-target=false"]);
+        let options = Options::new(&args, &Config::default()).unwrap();
+        assert!(!options.seed_target);
+    }
+
+    #[test]
+    fn seed_target_false_from_config() {
+        let args = Args::parse_from(["mutants"]);
+        let config = Config::from_str("seed_target = false").unwrap();
+        let options = Options::new(&args, &config).unwrap();
+        assert!(!options.seed_target);
+    }
+
+    #[test]
+    fn seed_target_command_line_overrides_config() {
+        let args = Args::parse_from(["mutants", "--seed-target=true"]);
+        let config = Config::from_str("seed_target = false").unwrap();
+        let options = Options::new(&args, &config).unwrap();
+        assert!(options.seed_target);
+    }
+
+    #[test]
+    fn schemata_on_by_default() {
+        let options = Options::from_arg_strs(["mutants"]);
+        assert_eq!(
+            options.schemata,
+            Choice {
+                value: true,
+                on_command_line: false
+            }
+        );
+    }
+
+    #[test]
+    fn schemata_false_in_config_turns_schemata_off() {
+        let options = Options::from_arg_strs_and_config(["mutants"], "schemata = false");
+        assert_eq!(
+            options.schemata,
+            Choice {
+                value: false,
+                on_command_line: false
+            }
+        );
+    }
+
+    #[test]
+    fn schemata_on_command_line_overrides_config() {
+        for (args, value) in [
+            (["mutants", "--schemata"].as_slice(), true),
+            (&["mutants", "--schemata=true"], true),
+            (&["mutants", "--schemata=false"], false),
+            (&["mutants", "--no-schemata"], false),
+            (&["mutants", "--schemata", "--no-schemata"], false),
+            (&["mutants", "--no-schemata", "--schemata"], true),
+        ] {
+            for config in ["schemata = true", "schemata = false"] {
+                assert_eq!(
+                    Options::from_arg_strs_and_config(args, config).schemata,
+                    Choice {
+                        value,
+                        on_command_line: true
+                    },
+                    "{args:?} with {config:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_selection_coverage_by_default() {
+        let options = Options::from_arg_strs(["mutants"]);
+        assert_eq!(
+            options.test_selection,
+            Choice {
+                value: TestSelection::Coverage,
+                on_command_line: false
+            }
+        );
+    }
+
+    #[test]
+    fn test_selection_all_in_config_is_overridden_by_command_line() {
+        let config = r#"test_selection = "all""#;
+        assert_eq!(
+            Options::from_arg_strs_and_config(["mutants"], config).test_selection,
+            Choice {
+                value: TestSelection::All,
+                on_command_line: false
+            }
+        );
+        assert_eq!(
+            Options::from_arg_strs_and_config(["mutants", "--test-selection=coverage"], config)
+                .test_selection,
+            Choice {
+                value: TestSelection::Coverage,
+                on_command_line: true
+            }
+        );
+    }
+
+    #[test]
+    fn seed_target_accepted_with_copy_target() {
+        let args = Args::try_parse_from(["mutants", "--seed-target=false", "--copy-target=true"])
+            .expect("--seed-target and --copy-target can be combined");
+        let options = Options::new(&args, &Config::default()).unwrap();
+        assert!(!options.seed_target);
         assert!(options.copy_target);
     }
 

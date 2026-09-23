@@ -1,0 +1,13 @@
+# A tree whose test reads its own source file from a path computed at runtime, so
+# `cargo mutants --schemata` can't tell beforehand that it does. The tests fail
+# with the schema and no mutant active, so every mutant must be tested the classic
+# way.
+
+[package]
+name = "cargo-mutants-testdata-schemata-reads-source-at-runtime"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+doctest = false

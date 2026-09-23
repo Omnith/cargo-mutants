@@ -34,6 +34,7 @@
   - [Jobserver](jobserver.md)
   - [Sharding](shards.md)
   - [Testing code changed in a diff](in-diff.md)
+  - [Mutant schemata](schemata.md)
 - [Integrations](integrations.md)
 - [Continuous integration](ci.md)
   - [Incremental tests of pull requests](pr-diff.md)

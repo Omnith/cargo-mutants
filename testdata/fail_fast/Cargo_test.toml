@@ -1,0 +1,10 @@
+[package]
+name = "cargo-mutants-testdata-fail-fast"
+description = "A fast test that fails when mutated, next to a slow test that passes when mutated, to show cargo-mutants stops the tests at the first failure"
+version = "0.0.0"
+edition = "2021"
+authors = ["Martin Pool"]
+publish = false
+
+[lib]
+doctest = false

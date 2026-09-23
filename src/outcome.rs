@@ -20,6 +20,8 @@ use crate::exit_code::ExitCode;
 use crate::process::Exit;
 use crate::{Options, Result, Scenario, output};
 
+pub mod timing;
+
 /// What phase of running a scenario.
 ///
 /// Every scenario proceed through up to three phases in order. They are:

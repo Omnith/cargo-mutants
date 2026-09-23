@@ -17,8 +17,16 @@ use tracing::{debug, debug_span, error, trace, warn};
 
 use crate::{
     BaselineStrategy, BuildDir, Console, Context, Mutant, Options, Phase, Result, Scenario,
-    ScenarioOutcome, cargo::run_cargo, options::TestPackages, outcome::LabOutcome,
-    output::OutputDir, package::Package, package::PackageSelection, timeouts::Timeouts,
+    ScenarioOutcome,
+    cargo::{cargo_argv, run_cargo},
+    check_interrupted,
+    fail_fast::KnownTestsBySelection,
+    options::TestPackages,
+    outcome::LabOutcome,
+    output::OutputDir,
+    package::Package,
+    package::PackageSelection,
+    timeouts::Timeouts,
     workspace::Workspace,
 };
 
@@ -49,27 +57,24 @@ pub fn test_mutants(
     }
     let output_mutex = Mutex::new(output_dir);
     let baseline_build_dir = BuildDir::for_baseline(workspace, options, console)?;
-    let jobserver = options
-        .jobserver
-        .then(|| {
-            let n_tasks = options.jobserver_tasks.unwrap_or_else(num_cpus::get);
-            debug!(n_tasks, "starting jobserver");
-            jobserver::Client::new(n_tasks)
-        })
-        .transpose()
-        .context("Start jobserver")?;
-    let tests_for_mutant = TestsForMutant::new(options, workspace);
     let lab = Lab {
         output_mutex,
-        jobserver,
-        tests_for_mutant,
+        jobserver: make_jobserver(options)?,
+        tests_for_mutant: TestsForMutant::new(options, workspace),
         options,
         console,
     };
+    let mut known_tests = KnownTestsBySelection::default();
     let timeouts = match options.baseline {
         BaselineStrategy::Run => {
-            let outcome = lab.run_baseline(&baseline_build_dir, &mutants)?;
+            let selection = baseline_selection(&mutants);
+            let outcome = lab.run_baseline(&baseline_build_dir, &selection)?;
             if outcome.success() {
+                known_tests.add_baseline(
+                    options,
+                    cargo_argv(&selection, Phase::Test, options),
+                    &outcome.get_log_content()?,
+                );
                 Timeouts::from_baseline(&outcome, options)
             } else {
                 error!(
@@ -83,40 +88,28 @@ pub fn test_mutants(
                     .finish();
             }
         }
+        // Without a baseline no test names are known, so tests aren't stopped early.
         BaselineStrategy::Skip => Timeouts::without_baseline(options),
     };
     debug!(?timeouts);
 
-    let build_dir_0 = Mutex::new(Some(baseline_build_dir));
-    // Create n threads, each dedicated to one build directory. Each of them tries to take a
-    // scenario to test off the queue, and then exits when there are no more left.
+    let n_workers = worker_count(options, mutants.len());
+    let build_dirs = lab.ready_build_dirs(baseline_build_dir, n_workers, workspace)?;
     console.start_testing_mutants(mutants.len());
-    let n_threads = max(1, min(options.jobs.unwrap_or(1), mutants.len()));
-    let work_queue = &Mutex::new(mutants.into_iter());
-    thread::scope(|scope| -> crate::Result<()> {
-        let mut threads = Vec::new();
-        for _i_thread in 0..n_threads {
-            threads.push(scope.spawn(|| -> crate::Result<()> {
-                trace!(thread_id = ?thread::current().id(), "start thread");
-                // First thread to start can use the baseline's build dir;
-                // others need to copy a new one
-                let build_dir_0 = build_dir_0.lock().expect("lock build dir 0").take(); // separate for lock
-                let build_dir = &if let Some(d) = build_dir_0 {
-                    d
-                } else {
-                    BuildDir::copy_from(workspace.root(), options, console)?
-                };
-                lab.run_queue(build_dir, timeouts, work_queue)
-            }));
-        }
-        join_threads(threads)
-    })?;
+    lab.run_mutants(
+        mutants,
+        build_dirs,
+        n_workers,
+        workspace,
+        timeouts,
+        &known_tests,
+    )?;
 
     let output_dir = lab
         .output_mutex
         .into_inner()
         .expect("final unlock mutants queue");
-    console.lab_finished(&output_dir.lab_outcome, start_time, options);
+    console.lab_finished(&output_dir.lab_outcome, start_time, n_workers, options);
     let lab_outcome = output_dir.finish()?;
     if lab_outcome.total_mutants == 0 {
         // This should be unreachable as we also bail out before copying
@@ -128,6 +121,119 @@ pub fn test_mutants(
         );
     }
     Ok(lab_outcome)
+}
+
+/// Make `n` build dirs whose `target/` is seeded from the baseline build dir, in parallel.
+///
+/// Returns an empty list if the baseline has no target dir that can be copied, in which case
+/// each worker copies its own build dir from the source when it starts.
+///
+/// Seeding only saves time, so if some dirs can't be made (for example because the disk is
+/// full) this warns and returns the ones that were made; other workers copy the source as
+/// they would without seeding. Interruptions are still returned as errors.
+fn seeded_build_dirs(
+    baseline_build_dir: &BuildDir,
+    n: usize,
+    workspace: &Workspace,
+    options: &Options,
+    console: &Console,
+) -> Result<Vec<BuildDir>> {
+    let Some(seed_target) = baseline_build_dir.target_dir_for_seeding() else {
+        return Ok(Vec::new());
+    };
+    let seed_target = &seed_target;
+    thread::scope(|scope| {
+        let threads = (0..n)
+            .map(|_| {
+                scope.spawn(|| {
+                    BuildDir::copy_seeded(workspace.root(), seed_target, options, console)
+                })
+            })
+            .collect_vec();
+        let mut build_dirs = Vec::new();
+        for thread in threads {
+            match thread.join().unwrap_or_else(|panic| resume_unwind(panic)) {
+                Ok(build_dir) => build_dirs.push(build_dir),
+                Err(err) => {
+                    check_interrupted()?;
+                    warn!(
+                        "Failed to seed a build directory from the baseline, so it will be built from scratch: {err:#}"
+                    );
+                }
+            }
+        }
+        Ok(build_dirs)
+    })
+}
+
+/// The number of workers, each with its own build dir, to test `n_mutants` mutants.
+pub(crate) fn worker_count(options: &Options, n_mutants: usize) -> usize {
+    max(1, min(options.jobs.unwrap_or(1), n_mutants))
+}
+
+/// Test mutants the classic way, when a baseline has already been run elsewhere.
+///
+/// `build_dir` holds the unmutated tree, ideally already built. Further workers use build
+/// dirs seeded from its `target/` (see [`Options::seed_target`]), or copy the workspace.
+/// Outcomes are added to `output_dir`, which is returned with the number of workers used.
+///
+/// A mutant's tests stop at the first failure of one of the `known_tests` of its
+/// package selection.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn test_mutants_after_baseline(
+    mutants: Vec<Mutant>,
+    workspace: &Workspace,
+    output_dir: OutputDir,
+    build_dir: BuildDir,
+    timeouts: Timeouts,
+    known_tests: &KnownTestsBySelection,
+    options: &Options,
+    console: &Console,
+) -> Result<(OutputDir, usize)> {
+    let lab = Lab {
+        output_mutex: Mutex::new(output_dir),
+        jobserver: make_jobserver(options)?,
+        tests_for_mutant: TestsForMutant::new(options, workspace),
+        options,
+        console,
+    };
+    let n_workers = worker_count(options, mutants.len());
+    let build_dirs = lab.ready_build_dirs(build_dir, n_workers, workspace)?;
+    lab.run_mutants(
+        mutants,
+        build_dirs,
+        n_workers,
+        workspace,
+        timeouts,
+        known_tests,
+    )?;
+    let output_dir = lab.output_mutex.into_inner().expect("unlock output dir");
+    Ok((output_dir, n_workers))
+}
+
+/// The packages whose tests the baseline runs: all those with mutants.
+fn baseline_selection(mutants: &[Mutant]) -> PackageSelection {
+    PackageSelection::Explicit(
+        mutants
+            .iter()
+            .map(|m| Arc::clone(&m.source_file.package))
+            .sorted_by_key(|p| p.name.clone())
+            .unique()
+            .collect_vec(),
+    )
+}
+
+/// Start a jobserver, if the options ask for one.
+pub(crate) fn make_jobserver(options: &Options) -> Result<Option<jobserver::Client>> {
+    options
+        .jobserver
+        .then(|| {
+            let n_tasks = options.jobserver_tasks.unwrap_or_else(num_cpus::get);
+            debug!(n_tasks, "starting jobserver");
+            jobserver::Client::new(n_tasks)
+        })
+        .transpose()
+        .context("Start jobserver")
 }
 
 #[mutants::skip] // it's a little hard to observe that the threads were collected?
@@ -170,41 +276,101 @@ struct Lab<'a> {
 }
 
 impl Lab<'_> {
-    /// Run the baseline scenario, which is the same as running `cargo test` on the unmutated
-    /// tree.
+    /// The build dirs for `n_workers` workers to start with: `build_dir_0`, plus build dirs
+    /// seeded from its `target/` if that's enabled and there's more than one worker.
     ///
-    /// If it fails, return None, indicating that no further testing should be done.
+    /// Workers that don't get one of these copy the workspace when they start.
     ///
-    /// If it succeeds, return the timeouts to be used for the other scenarios.
-    fn run_baseline(&self, build_dir: &BuildDir, mutants: &[Mutant]) -> Result<ScenarioOutcome> {
-        let all_mutated_packages: Vec<Arc<Package>> = mutants
-            .iter()
-            .map(|m| Arc::clone(&m.source_file.package))
-            .sorted_by_key(|p| p.name.clone())
-            .unique()
-            .collect_vec();
-        self.make_worker(build_dir).run_one_scenario(
-            &Scenario::Baseline,
-            &PackageSelection::Explicit(all_mutated_packages),
-            Timeouts::for_baseline(self.options),
-        )
+    /// `build_dir_0` must not be mutated or built while this runs, so that the seeded dirs
+    /// copy a complete and consistent target dir.
+    fn ready_build_dirs(
+        &self,
+        build_dir_0: BuildDir,
+        n_workers: usize,
+        workspace: &Workspace,
+    ) -> Result<Vec<BuildDir>> {
+        let options = self.options;
+        // Only seed from a target dir that the baseline built.
+        let seeded = if options.seed_target
+            && !options.in_place
+            && options.baseline == BaselineStrategy::Run
+            && n_workers > 1
+        {
+            seeded_build_dirs(
+                &build_dir_0,
+                n_workers - 1,
+                workspace,
+                options,
+                self.console,
+            )?
+        } else {
+            Vec::new()
+        };
+        Ok(std::iter::once(build_dir_0).chain(seeded).collect_vec())
     }
 
-    /// Run until the input queue is empty.
+    /// Test all the mutants on `n_workers` threads, each dedicated to one build dir.
     ///
-    /// The queue, inside a mutex, can be consumed by multiple threads.
-    fn run_queue(
+    /// Workers take a build dir from `build_dirs` if any are left, or otherwise copy the
+    /// workspace.
+    fn run_mutants(
+        &self,
+        mutants: Vec<Mutant>,
+        build_dirs: Vec<BuildDir>,
+        n_workers: usize,
+        workspace: &Workspace,
+        timeouts: Timeouts,
+        known_tests: &KnownTestsBySelection,
+    ) -> Result<()> {
+        let ready_build_dirs = Mutex::new(build_dirs);
+        // Each thread tries to take a scenario to test off the queue, and then exits when
+        // there are no more left.
+        let work_queue = &Mutex::new(mutants.into_iter());
+        thread::scope(|scope| -> crate::Result<()> {
+            let mut threads = Vec::new();
+            for _i_thread in 0..n_workers {
+                threads.push(scope.spawn(|| -> crate::Result<()> {
+                    trace!(thread_id = ?thread::current().id(), "start thread");
+                    let ready_build_dir = ready_build_dirs.lock().expect("lock build dirs").pop(); // separate for lock
+                    let build_dir = &if let Some(d) = ready_build_dir {
+                        d
+                    } else {
+                        BuildDir::copy_from(workspace.root(), self.options, self.console)?
+                    };
+                    self.make_worker(build_dir, known_tests)
+                        .run_queue(work_queue, timeouts)
+                }));
+            }
+            join_threads(threads)
+        })
+    }
+
+    /// Run the baseline scenario, which is the same as running `cargo test` of `selection`
+    /// on the unmutated tree.
+    ///
+    /// The outcome says whether it succeeded, and so whether mutants can be tested.
+    fn run_baseline(
         &self,
         build_dir: &BuildDir,
-        timeouts: Timeouts,
-        work_queue: &Mutex<vec::IntoIter<Mutant>>,
-    ) -> Result<()> {
-        self.make_worker(build_dir).run_queue(work_queue, timeouts)
+        selection: &PackageSelection,
+    ) -> Result<ScenarioOutcome> {
+        let no_known_tests = KnownTestsBySelection::default();
+        self.make_worker(build_dir, &no_known_tests)
+            .run_one_scenario(
+                &Scenario::Baseline,
+                selection,
+                Timeouts::for_baseline(self.options),
+            )
     }
 
-    fn make_worker<'a>(&'a self, build_dir: &'a BuildDir) -> Worker<'a> {
+    fn make_worker<'a>(
+        &'a self,
+        build_dir: &'a BuildDir,
+        known_tests: &'a KnownTestsBySelection,
+    ) -> Worker<'a> {
         Worker {
             build_dir,
+            known_tests,
             output_mutex: &self.output_mutex,
             jobserver: self.jobserver.as_ref(),
             tests_for_mutant: &self.tests_for_mutant,
@@ -220,6 +386,8 @@ impl Lab<'_> {
 /// appending output to the output directory.
 struct Worker<'a> {
     build_dir: &'a BuildDir,
+    /// Tests whose failure stops a mutant's tests, for each package selection.
+    known_tests: &'a KnownTestsBySelection,
     output_mutex: &'a Mutex<OutputDir>,
     jobserver: Option<&'a jobserver::Client>,
     tests_for_mutant: &'a TestsForMutant,
@@ -242,13 +410,7 @@ impl Worker<'_> {
                 return Ok(());
             };
             let _span = debug_span!("mutant", name = mutant.name(false)).entered();
-            let test_packages = match self.tests_for_mutant {
-                TestsForMutant::Workspace => PackageSelection::All,
-                TestsForMutant::Mutated => {
-                    PackageSelection::Explicit(vec![mutant.source_file.package.clone()])
-                }
-                TestsForMutant::Explicit(packages) => PackageSelection::Explicit(packages.clone()),
-            };
+            let test_packages = self.tests_for_mutant.selection(&mutant);
             self.run_one_scenario(&Scenario::Mutant(mutant), &test_packages, timeouts)?;
         }
     }
@@ -268,6 +430,9 @@ impl Worker<'_> {
         self.console
             .scenario_started(dir, scenario, scenario_output.open_log_read()?);
         debug!(?test_packages);
+        let stop_on_failure =
+            self.known_tests
+                .get(&cargo_argv(test_packages, Phase::Test, self.options));
 
         if let Some(mutant) = scenario.mutant() {
             let mutated_code = mutant.mutated_code();
@@ -292,6 +457,7 @@ impl Worker<'_> {
                 &mut scenario_output,
                 self.options,
                 self.console,
+                stop_on_failure,
             ) {
                 Ok(phase_result) => {
                     let success = phase_result.is_success(); // so we can move it away
@@ -338,13 +504,24 @@ pub enum TestsForMutant {
 }
 
 impl TestsForMutant {
-    fn new(options: &Options, workspace: &Workspace) -> Self {
+    pub(crate) fn new(options: &Options, workspace: &Workspace) -> Self {
         match options.test_package {
             TestPackages::Workspace => TestsForMutant::Workspace,
             TestPackages::Mutated => TestsForMutant::Mutated,
             TestPackages::Named(ref package_names) => {
                 TestsForMutant::Explicit(workspace.packages_by_name(package_names))
             }
+        }
+    }
+
+    /// The packages whose tests should run for a mutant.
+    pub(crate) fn selection(&self, mutant: &Mutant) -> PackageSelection {
+        match self {
+            TestsForMutant::Workspace => PackageSelection::All,
+            TestsForMutant::Mutated => {
+                PackageSelection::Explicit(vec![mutant.source_file.package.clone()])
+            }
+            TestsForMutant::Explicit(packages) => PackageSelection::Explicit(packages.clone()),
         }
     }
 }

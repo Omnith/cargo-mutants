@@ -1,0 +1,19 @@
+# A workspace whose tests read source files as text with `include_str!`, checking
+# code that the schema keeps, as an architecture test might. Under
+# `cargo mutants --schemata` the files named by string literals are embedded like
+# any other, since their text is the same for every mutant; but mutants in them
+# that the schema reports missed are tested again the classic way, where the
+# mutated text can make those tests fail.
+#
+# In `root_reader` an integration test reads the crate root, which also gets the
+# schema's helper module. In `module_reader` the crate root reads a module.
+#
+# `area` and `sub` are only checked by reading their source, so their mutants are
+# missed with the schema and caught the classic way. `perimeter` and `add` are
+# tested by calling them, so their mutants are caught with the schema. `double` is
+# not tested at all and not in a file that is read, so its mutants are missed both
+# ways, without being tested again.
+
+[workspace]
+members = ["root_reader", "module_reader"]
+resolver = "2"

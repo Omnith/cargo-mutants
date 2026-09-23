@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Changed: cargo-mutants now builds the tree once for all the mutants it can, rather than once per mutant, using *mutant schemata*: all the mutants are compiled into one program, and each is selected at runtime by an environment variable, so each mutant costs only a run of the tests. Mutants that can't be embedded, such as those in `const` contexts or proc-macro crates, are still built and tested separately in the same run, as are missed mutants whose result with the schema might differ, for example because tests read their source file. Mutants whose compile errors prove them unviable are recorded as unviable without building them again. Without `--jobs`, cargo-mutants measures how many mutants to test at once. On one crate with 2,074 mutants, a full run took 9 minutes, against an estimated 5.5 hours before. Schemata don't support `--test-tool=nextest`, `--in-place`, `--check`, or `--baseline=skip`: with any of these, every mutant is built separately, and cargo-mutants says so. Turn schemata off with `--no-schemata` or `schemata = false` in `.cargo/mutants.toml`. Because mutants are tested concurrently, the order of results can vary between runs; use `-j1` for a fixed order. If no test process records running the tree's code with the mutant id, as when a target runner runs tests in a sandbox, every mutant is built separately, with a warning. See [Mutant schemata](https://mutants.rs/schemata.html).
+
+- New: With schemata, each mutant runs only the tests that execute its code, according to coverage of the unmutated tree, fastest first, confirming a missed mutant by running all the tests. A mutant whose code no test executes is reported missed without running tests, and listed in `uncovered.txt`, only if the schema also recorded that its code never ran in the baseline; if it ran, for example in a process that a test killed, which writes no coverage, all the tests run for it. This needs the `llvm-tools` rustup component for the toolchain that builds the tree (`rustup component add llvm-tools`); without it, all the tests run, and cargo-mutants says so once. `--test-selection=all` or `test_selection = "all"` runs all the tests. See [Coverage-based test selection](https://mutants.rs/schemata.html#coverage-based-test-selection).
+
+- New: cargo-mutants stops a mutant's tests as soon as the test harness reports a failed test, rather than waiting for the rest of the tests in that binary, which can make caught mutants much faster to test when some tests are slow. Only failures of tests that passed in the baseline are trusted. The caught mutant's log then names the failing test, and gives a command that reruns just that mutant with the complete output of its tests. `--stop-tests-on-failure=false` or `stop_tests_on_failure = false` in the config turns this off. See [Fail-fast tests](https://mutants.rs/fail-fast.html).
+
+- New: With `--jobs` greater than 1, the extra build directories are seeded with a copy of the baseline build's `target/` directory, so each job no longer builds all dependencies from scratch before testing its first mutant. Workspace packages are still rebuilt in each build directory. The copy uses reflinks where the filesystem supports them. Turn this off with `--seed-target=false` or `seed_target = false` in `.cargo/mutants.toml`.
+
+- Fixed: Copied source files now always get a modification time of now, including when the filesystem doesn't support reflinks. Previously the source file's modification time was sometimes kept.
+
+- New: At the end of a run cargo-mutants prints a short breakdown of where the time went, just before the final summary line: time spent in cargo versus wall-clock time and worker utilization, per-phase median/p95/max times for mutants, the baseline's times, time spent on each outcome (such as unviable mutants and timeouts), and the slowest mutants. It's hidden by `--no-times`, and always written to `mutants.out/debug.log` as structured events. See [Timing breakdown](https://mutants.rs/output.html#timing-breakdown).
+
+- Fixed: `mutants.out/outcomes.json` is now replaced atomically, so it's never left truncated or invalid if cargo-mutants is killed while writing it. While mutants are being tested, it's rewritten at most about once per second rather than after every mutant, which removes several seconds of quadratic serialization cost from large runs. It's still written immediately after the baseline, and brought fully up to date when the run finishes or is interrupted.
+
 - New: `#[mutants::exclude_re("pattern")]` attribute to exclude specific mutations by regex, without disabling all mutations on the function. The attribute can be placed on functions, `impl` blocks, `trait` blocks, modules, files, and on expressions that can carry an attribute (such as `match`, struct literals, call expressions, method calls, and unary expressions). Multiple patterns can be applied. Also supported within `cfg_attr`. Requires the [mutants](https://crates.io/crates/mutants) crate version `0.0.5` or later.
 
 - Fixed: `#[mutants::skip]` (and `#[cfg_attr(..., mutants::skip)]`) is now honoured when placed on `const` and `static` items, including associated constants in `impl` and `trait` blocks. Previously the attribute was silently ignored on these items and operator mutants inside the initializer expression were still generated ([#508](https://github.com/sourcefrog/cargo-mutants/issues/508)).
@@ -11,6 +25,16 @@
 - Fixed: Shorter temporary directory names on Windows, to reduce the risk of running into the 260-character path limit.
 
 - Fixed: Support for Illumos, by updating to `fs4`.
+
+- Fixed: The command that a stopped mutant's log gives to rerun it now repeats the options given on the command line, such as `--features`, `--profile`, `--cargo-arg`, `--test-package`, timeouts, and the arguments after `--`, leaving out only those that select mutants or shape the run, so the mutant is built and tested as it was. It writes its output to `mutants.out/rerun/mutants.out`, so running it no longer moves the run's `mutants.out` to `mutants.out.old`. Its PowerShell quoting now also doubles typographic single quotes.
+
+- Docs: Stopping tests at the first failure can record a mutant as caught that would otherwise have timed out, if it makes one test fail and another hang, which can change the exit code. The log of a stopped mutant doesn't have the output that libtest prints after all the tests finish, such as the failing test's panic message.
+
+- Fixed: Options that can't be used together, such as `--schemata --in-place` or `--no-schemata --test-selection=coverage`, and `--test-selection=coverage` without llvm-tools, are rejected before the previous `mutants.out` is moved to `mutants.out.old`.
+
+- Changed: `caught.txt`, `missed.txt`, `timeout.txt`, and `unviable.txt` are rewritten at the end of the run, including an interrupted run, in the order the mutants were discovered, so they don't vary with the order in which concurrent jobs finish. `outcomes.json` keeps the order in which mutants finished.
+
+- Fixed: Each build directory now builds into its own `target/` directory, even if `CARGO_TARGET_DIR`, or `build.target-dir` in cargo config, names a target directory for all builds. Previously, concurrent jobs then built into the same directory, and could test one mutant with another's build products. Build products already in the configured directory aren't reused. With `--in-place`, the configured directory is still used.
 
 ## 27.1.0
 

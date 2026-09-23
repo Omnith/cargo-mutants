@@ -88,6 +88,11 @@ impl Workspace {
         &self.metadata.workspace_root
     }
 
+    /// The `cargo metadata` for the workspace, without dependencies.
+    pub fn metadata(&self) -> &cargo_metadata::Metadata {
+        &self.metadata
+    }
+
     /// Open the workspace containing a given directory.
     pub fn open<P: AsRef<Path>>(start_dir: P) -> Result<Self> {
         let start_dir = start_dir.as_ref();

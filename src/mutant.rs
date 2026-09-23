@@ -46,6 +46,19 @@ pub enum MutationTarget {
     },
 }
 
+/// Syntax enclosing a mutation, recorded for the experimental mutant-schemata generator.
+///
+/// This is internal: it is not serialized into `mutants.json` or `outcomes.json`.
+#[derive(Clone, Copy, Eq, PartialEq, Debug)]
+pub enum EnclosingSyntax {
+    /// The whole binary expression (including compound assignments) whose operator is replaced.
+    BinaryExpr(Span),
+    /// The whole unary expression whose operator is deleted.
+    UnaryExpr(Span),
+    /// The pattern of a deleted match arm, and its existing guard expression, if any.
+    MatchArm { pat: Span, guard: Option<Span> },
+}
+
 /// A mutation applied to source code.
 #[derive(Clone, Eq, PartialEq, Debug)]
 pub struct Mutant {
@@ -88,6 +101,11 @@ pub struct Mutant {
     /// This provides structured information about the mutation target, rather than
     /// encoding it in strings that need to be parsed.
     pub target: Option<MutationTarget>,
+
+    /// Syntax enclosing the mutated span, if the generator needs more than `span`.
+    ///
+    /// Only used by `--schemata`; not serialized.
+    pub(crate) enclosing: Option<EnclosingSyntax>,
 }
 
 /// The function containing a mutant.
@@ -132,9 +150,17 @@ impl Mutant {
             replacement,
             genre,
             target,
+            enclosing: None,
         };
         mutant.name = mutant.name(true);
         mutant
+    }
+
+    /// Record the syntax enclosing this mutation, for the schemata generator.
+    #[must_use]
+    pub(crate) fn with_enclosing(mut self, enclosing: Option<EnclosingSyntax>) -> Self {
+        self.enclosing = enclosing;
+        self
     }
 
     /// Return text of the whole file with the mutation applied.

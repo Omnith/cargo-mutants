@@ -1,0 +1,11 @@
+# A package whose only mutants are in a `const fn`, so can't be embedded, and
+# whose test fails in the unmutated tree.
+
+[package]
+name = "cargo-mutants-testdata-schemata-const-only"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+doctest = false

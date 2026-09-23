@@ -64,8 +64,15 @@ skip_calls = [
 # Use built-in defaults for skip_calls (includes "with_capacity")
 skip_calls_defaults = true
 
-# Choose test tool: "cargo" or "nextest"
+# Choose test tool: "cargo" or "nextest" (nextest turns off schemata)
 test_tool = "cargo"
+
+# Build all the mutants it can into one program, rather than building each separately
+schemata = true
+
+# With schemata, which tests to run for each mutant: "coverage" runs only the tests
+# that execute the mutated code (needs the llvm-tools rustup component), "all" runs all
+test_selection = "coverage"
 
 # Run tests from these specific packages for all mutants
 test_package = ["my-core-package", "my-utils"]

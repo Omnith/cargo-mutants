@@ -4,6 +4,8 @@
 
 You can use nextest to run your tests with cargo-mutants, instead of `cargo test`, by either passing the `--test-tool=nextest` option, or setting `test_tool = "nextest"` in `.cargo/mutants.toml`.
 
+[Mutant schemata](schemata.md) only support `cargo test`, so with nextest every mutant is built and tested separately, which is usually much slower.
+
 ## Controlling nextest
 
 You can pass additional arguments to nextest through the same [options and configuration keys as for Cargo](cargo-args.md).

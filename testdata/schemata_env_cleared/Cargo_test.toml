@@ -1,0 +1,17 @@
+# A tree whose tests run its code in a process that doesn't inherit the
+# environment: an integration test runs the binary with `env_clear()`. Under
+# `cargo mutants --schemata` that process doesn't see the mutant id, so runs the
+# unmutated code, and mutants it would catch look missed: they must be tested the
+# classic way to get the same outcomes as classic mutation testing.
+#
+# A unit test also runs its own test binary again with the environment inherited,
+# which does see the mutant id.
+
+[package]
+name = "cargo-mutants-testdata-schemata-env-cleared"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+doctest = false

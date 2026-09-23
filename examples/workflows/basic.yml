@@ -31,7 +31,9 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-mutants
-      - run: cargo mutants -vV --in-place
+      # llvm-tools lets each mutant run only the tests that execute its code.
+      - run: rustup component add llvm-tools
+      - run: cargo mutants -vV
       - uses: actions/upload-artifact@v7
         if: always()
         with:

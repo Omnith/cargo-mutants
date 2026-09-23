@@ -1,0 +1,16 @@
+# A tree for `cargo mutants --test-selection=coverage` with a test that fails when
+# run by itself, because it depends on state that another test sets.
+#
+# Coverage is collected by running each test alone, so the failing test's profile
+# stops before it calls `quadruple`, and `quadruple` looks as if no test executes
+# it, although the test checks its result when all the tests run. Its mutants must
+# still be caught, as they are without test selection.
+
+[package]
+name = "cargo-mutants-testdata-test-selection-coverage-fails-alone"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+doctest = false

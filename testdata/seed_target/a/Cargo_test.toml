@@ -1,0 +1,11 @@
+[package]
+name = "cargo-mutants-testdata-seed-target-a"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+doctest = false
+
+[dependencies]
+c = { path = "../c", package = "cargo-mutants-testdata-seed-target-c" }

@@ -1,0 +1,10 @@
+# A package whose crate root reads one of its modules.
+
+[package]
+name = "cargo-mutants-testdata-schemata-module-reader"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+doctest = false

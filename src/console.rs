@@ -17,6 +17,7 @@ use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::prelude::*;
 
 use crate::options::Colors;
+use crate::outcome::timing::TimingBreakdown;
 use crate::outcome::{LabOutcome, ScenarioOutcome, SummaryOutcome};
 use crate::scenario::Scenario;
 use crate::tail_file::TailFile;
@@ -186,10 +187,30 @@ impl Console {
         });
     }
 
-    pub fn lab_finished(&self, lab_outcome: &LabOutcome, start_time: Instant, options: &Options) {
+    /// Stop showing a scenario whose outcome won't be reported, because it will be
+    /// tested again another way.
+    pub fn scenario_abandoned(&self, dir: &Utf8Path) {
+        self.view.update(|model| model.remove_scenario(dir));
+    }
+
+    /// Show the final results of the lab, which ran with `workers` worker threads.
+    pub fn lab_finished(
+        &self,
+        lab_outcome: &LabOutcome,
+        start_time: Instant,
+        workers: usize,
+        options: &Options,
+    ) {
         self.view.update(|model| {
             model.scenario_models.clear();
         });
+        let wall = start_time.elapsed();
+        let timing_breakdown = TimingBreakdown::from_lab_outcome(lab_outcome);
+        timing_breakdown.trace(workers, wall);
+        if options.show_times && lab_outcome.total_mutants > 0 {
+            // Printed before the summary line, so that the summary stays last.
+            self.message(&format_timing_breakdown(&timing_breakdown, workers, wall));
+        }
         self.message(&format!(
             "{}\n",
             lab_outcome.summary_string(start_time, options)
@@ -660,6 +681,96 @@ pub fn style_scenario(scenario: &Scenario, line_col: bool) -> Cow<'static, str> 
     }
 }
 
+/// Format a compact human-readable breakdown of where the lab's time went.
+///
+/// Only the slowest [`CONSOLE_SLOWEST_SCENARIOS`] are shown, to keep it short; the debug
+/// log has the full list from [`TimingBreakdown::slowest`].
+fn format_timing_breakdown(breakdown: &TimingBreakdown, workers: usize, wall: Duration) -> String {
+    let mut s = format!(
+        "Time: {busy} cargo busy in {wall} wall with {workers}",
+        busy = format_duration(breakdown.cargo_busy),
+        wall = format_duration(wall),
+        workers = plural(workers, "worker"),
+    );
+    if let Some(utilization) = breakdown.utilization(workers, wall) {
+        write!(s, " ({:.0}% utilized)", utilization * 100.0).unwrap();
+    }
+    if !breakdown.baseline.is_empty() {
+        let baseline_phases: Vec<String> = breakdown
+            .baseline
+            .iter()
+            .map(|(phase, duration)| format!("{} {phase}", format_secs_tenths(*duration)))
+            .collect();
+        write!(s, "; baseline {}", baseline_phases.join(" + ")).unwrap();
+    }
+    s.push('\n');
+    for stats in &breakdown.phases {
+        writeln!(
+            s,
+            "  {phase} {count}: median {median}, p95 {p95}, max {max}, total {total}",
+            phase = stats.phase,
+            count = plural(stats.count, "mutant"),
+            median = format_secs_tenths(stats.median),
+            p95 = format_secs_tenths(stats.p95),
+            max = format_secs_tenths(stats.max),
+            total = format_duration(stats.total),
+        )
+        .unwrap();
+    }
+    if !breakdown.outcomes.is_empty() {
+        let by_outcome: Vec<String> = breakdown
+            .outcomes
+            .iter()
+            .map(|ot| {
+                format!(
+                    "{} {} {}",
+                    ot.count,
+                    outcome_label(&ot.outcome),
+                    format_duration(ot.total)
+                )
+            })
+            .collect();
+        writeln!(s, "  by outcome: {}", by_outcome.join(", ")).unwrap();
+    }
+    for (i, slow) in breakdown
+        .slowest
+        .iter()
+        .take(CONSOLE_SLOWEST_SCENARIOS)
+        .enumerate()
+    {
+        let heading = if i == 0 { "slowest:" } else { "" };
+        writeln!(
+            s,
+            "  {heading:8} {total} {name} ({outcome})",
+            total = format_secs_tenths(slow.total),
+            name = slow.name,
+            outcome = outcome_label(&slow.outcome),
+        )
+        .unwrap();
+    }
+    s
+}
+
+/// How many of the slowest mutants are shown in the console timing breakdown.
+const CONSOLE_SLOWEST_SCENARIOS: usize = 3;
+
+/// Format a duration as seconds with one decimal place, for per-mutant times.
+fn format_secs_tenths(duration: Duration) -> String {
+    format!("{:.1}s", duration.as_secs_f64())
+}
+
+/// A short lowercase word for a summary outcome, matching the final summary line.
+fn outcome_label(outcome: &SummaryOutcome) -> &'static str {
+    match outcome {
+        SummaryOutcome::CaughtMutant => "caught",
+        SummaryOutcome::MissedMutant => "missed",
+        SummaryOutcome::Unviable => "unviable",
+        SummaryOutcome::Timeout => "timeout",
+        SummaryOutcome::Success => "succeeded",
+        SummaryOutcome::Failure => "failed",
+    }
+}
+
 pub fn plural(n: usize, noun: &str) -> String {
     if n == 1 {
         format!("{n} {noun}")
@@ -670,7 +781,85 @@ pub fn plural(n: usize, noun: &str) -> String {
 
 #[cfg(test)]
 mod test {
+    use crate::outcome::timing::{OutcomeTime, PhaseStats, SlowScenario};
+
     use super::*;
+
+    #[test]
+    fn format_timing_breakdown_shows_utilization_phases_outcomes_and_slowest() {
+        let secs = Duration::from_secs;
+        let millis = Duration::from_millis;
+        let breakdown = TimingBreakdown {
+            phases: vec![
+                PhaseStats {
+                    phase: Phase::Build,
+                    count: 4,
+                    total: secs(95),
+                    median: millis(10_300),
+                    p95: secs(18),
+                    max: secs(72),
+                },
+                PhaseStats {
+                    phase: Phase::Test,
+                    count: 3,
+                    total: secs(30),
+                    median: millis(9_250),
+                    p95: secs(11),
+                    max: secs(11),
+                },
+            ],
+            baseline: vec![(Phase::Build, millis(3_100)), (Phase::Test, millis(900))],
+            outcomes: vec![
+                OutcomeTime {
+                    outcome: SummaryOutcome::CaughtMutant,
+                    count: 3,
+                    total: secs(113),
+                },
+                OutcomeTime {
+                    outcome: SummaryOutcome::Unviable,
+                    count: 1,
+                    total: secs(12),
+                },
+            ],
+            slowest: ["a", "b", "c", "d"]
+                .into_iter()
+                .zip([83, 20, 12, 10])
+                .map(|(name, total)| SlowScenario {
+                    name: format!("src/lib.rs:1:1: mutant {name}"),
+                    outcome: SummaryOutcome::CaughtMutant,
+                    total: secs(total),
+                })
+                .collect(),
+            cargo_busy: secs(129),
+        };
+        assert_eq!(
+            format_timing_breakdown(&breakdown, 2, secs(80)),
+            indoc::indoc! {"
+                Time: 2m cargo busy in 80s wall with 2 workers (81% utilized); baseline 3.1s build + 0.9s test
+                  build 4 mutants: median 10.3s, p95 18.0s, max 72.0s, total 2m
+                  test 3 mutants: median 9.2s, p95 11.0s, max 11.0s, total 30s
+                  by outcome: 3 caught 2m, 1 unviable 12s
+                  slowest: 83.0s src/lib.rs:1:1: mutant a (caught)
+                           20.0s src/lib.rs:1:1: mutant b (caught)
+                           12.0s src/lib.rs:1:1: mutant c (caught)
+            "}
+        );
+    }
+
+    #[test]
+    fn format_timing_breakdown_without_baseline_omits_baseline() {
+        let breakdown = TimingBreakdown {
+            phases: Vec::new(),
+            baseline: Vec::new(),
+            outcomes: Vec::new(),
+            slowest: Vec::new(),
+            cargo_busy: Duration::from_secs(9),
+        };
+        assert_eq!(
+            format_timing_breakdown(&breakdown, 1, Duration::from_secs(10)),
+            "Time: 9s cargo busy in 10s wall with 1 worker (90% utilized)\n"
+        );
+    }
 
     #[test]
     fn format_duration_test() {

@@ -1,0 +1,16 @@
+# A tree for `cargo mutants --test-selection=coverage` with a mutant that makes
+# the fastest test that executes its code hang, and a slower one fail.
+#
+# All the tests run at once, so the classic way the slower test's failure stops
+# the tests, and the mutant is caught, although another test hangs. Coverage-based
+# selection runs the fastest test alone first, so that times out; the mutant must
+# still be caught.
+
+[package]
+name = "cargo-mutants-testdata-test-selection-coverage-timeout"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+doctest = false

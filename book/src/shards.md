@@ -33,6 +33,8 @@ Note that the number of shards is set to match the `/8` in the `--shard` argumen
 
 [Sharding works with `--baseline=skip`](baseline.md), to avoid the cost of running the baseline on every shard. But, if you do this, then you must ensure that the tests suite is passing in the baseline, for example by checking it in a previous CI step.
 
+However, `--baseline=skip` turns off [mutant schemata](schemata.md), so each mutant in the shard is built separately. With schemata, each shard builds its schema once, and the baseline adds only one run of the tests, so skipping it saves little.
+
 ## Sharding algorithm
 
 The `--sharding` command line and config option controls the algorithm by which mutants are distributed across shards.

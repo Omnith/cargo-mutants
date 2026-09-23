@@ -1,0 +1,15 @@
+# Tests `--seed-target`: build dirs for extra jobs start from a copy of the
+# baseline's `target/`, but every workspace package must still be rebuilt in them.
+#
+# Package `a` has a weakly tested function, so all its mutants should be missed.
+# `a` depends on package `c`, which doesn't depend on `a` and has no mutants.
+# `c` records the directory where it was compiled, and a test in `a` checks that
+# this is the build dir where the test runs. If a seeded build dir reused `c` as
+# built in the baseline build dir, that test would fail and the `a` mutants would
+# wrongly be reported as caught.
+#
+# Run with `-j2`.
+
+[workspace]
+members = ["a", "c"]
+resolver = "2"

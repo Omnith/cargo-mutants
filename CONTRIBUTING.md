@@ -41,6 +41,8 @@ cargo-mutants tests require [`cargo-nextest`](https://nexte.st/) to be installed
 
 cargo-mutants tests can be run under either `cargo test` or `cargo nextest run`.
 
+The tests of coverage-based test selection also need the `llvm-tools` rustup component (`rustup component add llvm-tools`). Without it, they pass without testing anything, and say `SKIPPED` and why on stderr, which `cargo nextest run` shows because of `.config/nextest.toml`. In CI, that is when the `CI` environment variable is set, as GitHub Actions does, they fail instead, so that CI can't silently stop testing coverage-based selection: CI jobs that run the tests install `llvm-tools`. On a CI platform where the component isn't available, set `CARGO_MUTANTS_TESTS_ALLOW_MISSING_LLVM_TOOLS=1` to let them be skipped.
+
 ### Test naming
 
 Tests should have names that read like English sentences (or subsentences)

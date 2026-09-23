@@ -1,0 +1,17 @@
+# A tree whose tests interfere with each other when several copies run at once in
+# the same directory, as they would when `cargo mutants --schemata --jobs` tests
+# mutants in its one shared build directory: one test writes and reads back a file
+# at a fixed path.
+#
+# Another test fails once for each mutant, whether or not the mutant's code runs,
+# like a flaky test, so `--schemata` must test again the mutants whose tests fail
+# although their code never ran.
+
+[package]
+name = "cargo-mutants-testdata-schemata-interference"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+doctest = false

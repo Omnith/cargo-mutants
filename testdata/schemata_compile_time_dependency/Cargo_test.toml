@@ -1,0 +1,10 @@
+# A workspace with library code that runs at compile time, where the schema's
+# mutant id can't be seen: `table` is a build-dependency of `app`'s build
+# script, and `words` is a dependency of the proc-macro crate `macros`. Their
+# mutants are only caught by `app`'s tests through what the build script and
+# the macro generate, so `cargo mutants --schemata` tests them the classic way.
+# Mutants in `app` itself are embedded.
+
+[workspace]
+members = ["app", "table", "words", "macros"]
+resolver = "2"

@@ -6,6 +6,8 @@ With the `--in-place` option, it will instead mutate and test your code in the o
 
 `--in-place` is currently incompatible with the [`--jobs` option](parallelism.md), because running multiple jobs requires making multiple copies of the tree.
 
+`--in-place` also turns off [mutant schemata](schemata.md), so every mutant is built separately, which is usually much slower than copying the tree once.
+
 ## Cautions
 
 If you use `--in-place` then you shouldn't edit the code, commit, or run your own tests while tests are running, because cargo-mutants will be modifying the code at the same time.
