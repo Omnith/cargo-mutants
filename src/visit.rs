@@ -91,8 +91,11 @@ fn walk_package(
 ) -> Result<(Vec<Mutant>, Vec<SourceFile>)> {
     let mut mutants = Vec::new();
     let mut files = Vec::new();
-    let mut filename_queue =
-        VecDeque::from_iter(package.top_sources.iter().map(|p| (p.to_owned(), true)));
+    let mut filename_queue = package
+        .top_sources
+        .iter()
+        .map(|p| (p.to_owned(), true))
+        .collect::<VecDeque<_>>();
     while let Some((path, package_top)) = filename_queue.pop_front() {
         let Some(source_file) = SourceFile::load(workspace_dir, &path, package, package_top)?
         else {
@@ -962,7 +965,8 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
                                 struct_name: struct_name.clone(),
                             }),
                         );
-                        if !v.excluded_by_attr_re(&mutant.name) {
+                        if !v.excluded_by_attr_re(&mutant.name) && v.options.allows_mutant(&mutant)
+                        {
                             v.mutants.push(mutant);
                         }
                     }
@@ -1310,6 +1314,7 @@ mod test {
     mod exclude_re_expr_method_call;
     mod exclude_re_expr_struct;
     mod exclude_re_expr_unary;
+    mod re_options_expr_struct;
     mod skip_attr_cfg_attr;
     mod skip_attr_expr_call;
     mod skip_attr_expr_match;

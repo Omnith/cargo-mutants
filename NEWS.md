@@ -6,6 +6,8 @@
 
 - Fixed: `#[mutants::skip]` (and `#[cfg_attr(..., mutants::skip)]`) is now honoured when placed on `const` and `static` items, including associated constants in `impl` and `trait` blocks. Previously the attribute was silently ignored on these items and operator mutants inside the initializer expression were still generated ([#508](https://github.com/sourcefrog/cargo-mutants/issues/508)).
 
+- Fixed: `--re` and `--exclude-re` (and `examine_re` / `exclude_re` in the config file) now also filter the mutants that delete a field from a struct literal with a `..` base expression. Previously those mutants were always generated, whatever the filters.
+
 - Fixed: Shorter temporary directory names on Windows, to reduce the risk of running into the 260-character path limit.
 
 - Fixed: Support for Illumos, by updating to `fs4`.
