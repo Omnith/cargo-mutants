@@ -59,7 +59,12 @@ fn show_version() {
         .args(["mutants", "--version"])
         .assert()
         .success()
-        .stdout(predicates::str::is_match(r"^cargo-mutants \d+\.\d+\.\d+(-.*)?\n$").unwrap());
+        .stdout(
+            predicates::str::is_match(
+                r"^cargo-mutants \d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?\n$",
+            )
+            .unwrap(),
+        );
 }
 
 #[test]
