@@ -1,0 +1,10 @@
+# A package whose integration test compares a module with a golden copy.
+
+[package]
+name = "cargo-mutants-testdata-schemata-module-golden"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+doctest = false

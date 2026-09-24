@@ -4631,6 +4631,53 @@ fn schemata_tests_all_mutants_classically_when_baseline_fails_in_schemata_reads_
 }
 
 #[test]
+fn schemata_leaves_files_tests_read_out_of_the_schema_when_its_baseline_fails_in_schemata_golden_source_tree()
+ {
+    // Tests compare files named by string literals with golden copies, so they fail
+    // with the schema. Those files are left out of the schema and its baseline is run
+    // again: the other mutants stay embedded.
+    let report =
+        assert_schemata_outcomes_match_classic("schemata_golden_source", &["--workspace"], &[]);
+    let read_files = ["module_golden/src/table.rs", "root_golden/src/lib.rs"];
+    assert_eq!(report["source_read_files"], json!(read_files));
+    let retry = &report["baseline_retry"];
+    assert_eq!(retry["outcome"], "passed", "{retry}");
+    assert_eq!(retry["files"], json!(read_files));
+    assert_eq!(
+        retry["packages"],
+        json!(["cargo-mutants-testdata-schemata-root-golden"])
+    );
+    let tests = schemata_mutant_tests(&report);
+    assert!(!tests.is_empty());
+    for (name, _, _) in &tests {
+        assert!(name.starts_with("module_golden/src/lib.rs:"), "{name}");
+    }
+    let fallbacks = schemata_fallbacks(&report);
+    assert_eq!(retry["mutants"], fallbacks.len());
+    for (name, reason) in &fallbacks {
+        let expected = if name.starts_with("root_golden/src/shapes.rs:") {
+            // The crate root carries the helper module, so the whole package is left out.
+            "crate_root_read_by_tests"
+        } else {
+            assert!(
+                read_files.iter().any(|file| name.starts_with(file)),
+                "{name}"
+            );
+            "source_read_by_tests"
+        };
+        assert_eq!(reason, expected, "{name}");
+    }
+    let reasons = fallbacks.iter().map(|(_, reason)| reason).counts();
+    assert_eq!(reasons.len(), 2, "{reasons:?}");
+    for (reason, count) in reasons {
+        assert_eq!(
+            report["fallback_time_by_reason"][reason]["count"], count,
+            "{reason}"
+        );
+    }
+}
+
+#[test]
 fn schemata_tests_missed_mutants_classically_in_schemata_env_cleared_tree() {
     // An integration test runs the binary with a cleared environment, so it runs the
     // unmutated binary whatever the mutant: the binary's mutants look missed with the
