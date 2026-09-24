@@ -14,9 +14,11 @@
 //! 2. Check: `cargo check --tests` the schema, dropping mutants blamed for compile
 //!    errors and repeating until it's clean, at most [`MAX_CHECK_ITERATIONS`] times.
 //! 3. Build: `cargo test --no-run`, with the same dropping if it fails.
-//! 4. Baseline: run `cargo test -vv` with no mutant active; it must pass. Then replay
-//!    the test commands it printed (see [`replay`]), except those that ran no tests,
-//!    which must also pass.
+//! 4. Baseline: run `cargo test -vv` with no mutant active; it must pass. If it fails
+//!    only with the schema, files that tests might read are left out of the schema,
+//!    which is built again, and the baseline run again. Then replay the test commands
+//!    it printed (see [`replay`]), except those that ran no tests, which must also
+//!    pass.
 //! 5. Choose how many mutants to test at once: `--jobs`, or else by timing concurrent
 //!    runs of the tests (see [`jobs`]). Either way, check that concurrent runs pass.
 //! 6. Test each embedded mutant, in parallel, all in the same build directory, by
@@ -56,7 +58,7 @@ use tracing::{debug, error, info, warn};
 
 use self::coverage::collect::{CollectionReport, LlvmTools, collect};
 use self::coverage::{Confirm, FullSuiteReason, Plan, UnobservedFiles, same_test_binaries};
-use self::embed::{Blame, Embedding, proven_unviable};
+use self::embed::{Blame, Embedding, LeaveOut, proven_unviable};
 use self::jobs::Probe;
 use self::markers::Markers;
 use self::plan::FallbackReason;
@@ -330,6 +332,11 @@ struct Report {
     source_read_files: Vec<String>,
     /// Number of mutants embedded in `source_read_files` after the schema was built.
     source_read_mutants: usize,
+    /// If tests failed with the schema and no mutant active, and some files are in
+    /// `source_read_files`: what was left out of the schema before the baseline was run
+    /// again, what that cost, and how it ended.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    baseline_retry: Option<BaselineRetry>,
     /// Number of mutants tested at once: `--jobs` if given, or else chosen by
     /// `jobs_probe`.
     test_jobs: usize,
@@ -466,6 +473,45 @@ impl SelectionSummary {
     }
 }
 
+/// How running the schema baseline again, with files that tests might read left out
+/// of the schema, ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RetryOutcome {
+    /// The tests passed: the mutants still embedded are tested with the schema.
+    Passed,
+    /// No embedded mutant was in the files, so the schema would be the same, and the
+    /// baseline wasn't run again.
+    NothingLeftOut,
+    /// No mutant was left embedded, so the baseline wasn't run again.
+    NothingEmbedded,
+    /// The tests failed again with the schema, but passed on the unmutated tree.
+    SchemaChangesBehavior,
+    /// The tests failed on the unmutated tree too.
+    Failed,
+}
+
+/// The schema baseline run again with files that tests might read left out of the
+/// schema, in `schemata.json`.
+#[derive(Debug, Serialize)]
+struct BaselineRetry {
+    /// Files that tests might read, left out of the schema.
+    files: Vec<String>,
+    /// Packages all of whose mutants were left out, since tests might read one of
+    /// their crate roots.
+    packages: Vec<String>,
+    /// Embedded mutants that fell back because they were left out.
+    mutants: usize,
+    /// Duration of the baseline that failed, including testing the unmutated tree.
+    failed_baseline_seconds: f64,
+    /// Passes rebuilding the schema without the files.
+    build_passes: Vec<Pass>,
+    build_seconds: f64,
+    /// Duration of the baseline run again.
+    baseline_seconds: f64,
+    outcome: RetryOutcome,
+}
+
 #[derive(Debug, Serialize)]
 struct FallbackMutant {
     name: String,
@@ -542,12 +588,17 @@ impl Report {
     /// This is a fixed cost shared by all the embedded mutants, which have only a test
     /// phase, so it's emitted just before the other `timing.*` events in `debug.log`.
     fn trace_schema_build(&self) {
+        let retry_build_secs = self
+            .baseline_retry
+            .as_ref()
+            .map_or(0.0, |retry| retry.build_seconds);
         debug!(
             check_secs = self.check_seconds,
             check_passes = self.check_passes.len(),
             build_secs = self.build_seconds,
             build_passes = self.build_passes.len(),
-            total_secs = self.check_seconds + self.build_seconds,
+            retry_build_secs,
+            total_secs = self.check_seconds + self.build_seconds + retry_build_secs,
             "timing.schema_build"
         );
     }
@@ -789,11 +840,28 @@ pub(crate) fn test_mutants(
         process_status: crate::process::Exit::Success,
         argv: Vec::new(),
     };
-    let (baseline, captured, known_tests, baseline_logs) = match runner.baseline(
-        &selections,
-        &originals,
-        want_direct,
-    )? {
+    let baseline_start = Instant::now();
+    let mut baseline_result = runner.baseline(&selections, &originals, want_direct)?;
+    // If tests might read files that the schema rewrites, perhaps that's why they fail:
+    // then those files are left out, and the rest tested with the schema if it passes.
+    if matches!(baseline_result, Baseline::SchemaChangesBehavior(_))
+        && !packages.read_files.is_empty()
+    {
+        if let Some(retried) = retry_baseline_without_read_files(
+            &runner,
+            &mut embedding,
+            &LeaveOut::new(&packages.read_files, &packages.root_packages),
+            &selections,
+            &originals,
+            want_direct,
+            baseline_start.elapsed().as_secs_f64(),
+            &mut report,
+        )? {
+            baseline_result = retried;
+        }
+        report.write(&output_path);
+    }
+    let (baseline, captured, known_tests, baseline_logs) = match baseline_result {
         Baseline::Passed {
             result,
             commands,
@@ -1223,10 +1291,113 @@ fn write_uncovered_list(output_dir: &Utf8Path, mutant_tests: &[MutantTest]) -> R
 /// The logs of the schema build that was the baseline's build phase.
 fn baseline_build_logs(report: &Report) -> &[Utf8PathBuf] {
     report
-        .build_passes
-        .last()
+        .baseline_retry
+        .as_ref()
+        .and_then(|retry| retry.build_passes.last())
+        .or(report.build_passes.last())
         .or(report.check_passes.last())
         .map_or(&[], |pass| &pass.logs)
+}
+
+/// After the schema baseline failed with [`Baseline::SchemaChangesBehavior`], leave
+/// the files that tests might read (see [`LeaveOut`]) out of the schema, rebuild it,
+/// and run the baseline again, recording the retry in `report`.
+///
+/// Tests read the files' original text then, as they do the classic way, where their
+/// mutants are tested. The mutants' ids don't change.
+///
+/// Returns the new baseline, or `None` if it wasn't run again, because no embedded
+/// mutant was left out or none was left embedded.
+#[allow(clippy::too_many_arguments)]
+fn retry_baseline_without_read_files(
+    runner: &Runner,
+    embedding: &mut Embedding,
+    leave_out: &LeaveOut,
+    selections: &[PackageSelection],
+    originals: &[(Utf8PathBuf, String)],
+    want_direct: bool,
+    failed_baseline_seconds: f64,
+    report: &mut Report,
+) -> Result<Option<Baseline>> {
+    let mutants = embedding.leave_out(leave_out);
+    report.count(embedding);
+    let mut retry = BaselineRetry {
+        files: leave_out.files.iter().cloned().collect(),
+        packages: leave_out.packages.iter().cloned().collect(),
+        mutants,
+        failed_baseline_seconds,
+        build_passes: Vec::new(),
+        build_seconds: 0.0,
+        baseline_seconds: 0.0,
+        outcome: RetryOutcome::NothingLeftOut,
+    };
+    let baseline = if mutants == 0 && leave_out.roots.is_empty() {
+        None
+    } else {
+        info!("{}", left_out_message(&retry));
+        if embedding.embedded().next().is_some() {
+            retry.build_passes = runner.drop_until_clean(
+                embedding,
+                Phase::Build,
+                selections,
+                MAX_BUILD_ITERATIONS,
+            )?;
+            retry.build_seconds = retry.build_passes.iter().map(|p| p.seconds).sum();
+            report.count(embedding);
+        }
+        if embedding.embedded().next().is_none() {
+            retry.outcome = RetryOutcome::NothingEmbedded;
+            None
+        } else {
+            // Only the processes of this run say which sites run with no mutant active.
+            runner.markers.clear_baseline_runs()?;
+            let start = Instant::now();
+            let baseline = runner.baseline(selections, originals, want_direct)?;
+            retry.baseline_seconds = start.elapsed().as_secs_f64();
+            retry.outcome = match &baseline {
+                Baseline::Passed { .. } => RetryOutcome::Passed,
+                Baseline::SchemaChangesBehavior(_) => RetryOutcome::SchemaChangesBehavior,
+                Baseline::Failed(..) => RetryOutcome::Failed,
+            };
+            Some(baseline)
+        }
+    };
+    debug!(
+        files = retry.files.len(),
+        packages = ?retry.packages,
+        mutants = retry.mutants,
+        failed_baseline_secs = retry.failed_baseline_seconds,
+        build_secs = retry.build_seconds,
+        baseline_secs = retry.baseline_seconds,
+        outcome = ?retry.outcome,
+        "schemata.baseline.retry"
+    );
+    report.baseline_retry = Some(retry);
+    Ok(baseline)
+}
+
+/// Say, in one line, which files are left out of the schema and why.
+fn left_out_message(retry: &BaselineRetry) -> String {
+    /// Files named in full; the rest are counted.
+    const MAX_NAMED: usize = 3;
+    let named = retry.files.iter().take(MAX_NAMED).join(", ");
+    let files = match retry.files.len().checked_sub(MAX_NAMED) {
+        Some(more) if more > 0 => format!("{named} and {more} more"),
+        _ => named,
+    };
+    let packages = if retry.packages.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " and in {}, whose crate roots they read,",
+            retry.packages.join(", ")
+        )
+    };
+    format!(
+        "Tests fail with the schema, perhaps because they read {files}: testing the {mutants} \
+        mutants in them{packages} the classic way",
+        mutants = retry.mutants,
+    )
 }
 
 /// Record the outcome of the baseline, made of `phase_results`, in `output_dir`.
@@ -1286,6 +1457,8 @@ fn distinct_selections(
 struct PackagePlan {
     /// Crate roots that get the helper module, with their text, by tree-relative path.
     roots: BTreeMap<Utf8PathBuf, String>,
+    /// The package of each crate root in `roots`.
+    root_packages: BTreeMap<Utf8PathBuf, String>,
     /// Packages none of whose mutants can be embedded, and why.
     fallbacks: HashMap<String, FallbackReason>,
     /// Tree-relative paths, with `/` separators, of files that string literals in
@@ -1302,7 +1475,8 @@ struct PackagePlan {
 ///
 /// Files that tests might read, including crate roots, are embedded like any other,
 /// since tests read the same schema text whichever mutant is active; the baseline
-/// checks that they pass with it.
+/// checks that they pass with it. If they don't, those files are left out of the
+/// schema (see [`retry_baseline_without_read_files`]).
 fn plan_packages(workspace: &Workspace, mutants: &[Mutant]) -> Result<PackagePlan> {
     let mutated: HashSet<&str> = mutants
         .iter()
@@ -1344,6 +1518,8 @@ fn plan_packages(workspace: &Workspace, mutants: &[Mutant]) -> Result<PackagePla
             let text = read_to_string(&target.src_path)
                 .with_context(|| format!("read crate root {}", target.src_path))?;
             plan.roots.insert(relative.to_owned(), text);
+            plan.root_packages
+                .insert(relative.to_owned(), package.name.to_string());
         }
         package_dirs.push(
             package
@@ -1547,6 +1723,27 @@ mod test {
         ] {
             assert!(!enabled(&options).unwrap());
         }
+    }
+
+    #[test]
+    fn left_out_message_names_three_files_and_the_packages_whose_crate_roots_are_read() {
+        let retry = BaselineRetry {
+            files: ["a.rs", "b.rs", "c.rs", "d.rs", "e.rs"]
+                .map(String::from)
+                .into(),
+            packages: vec!["p".to_owned()],
+            mutants: 12,
+            failed_baseline_seconds: 0.0,
+            build_passes: Vec::new(),
+            build_seconds: 0.0,
+            baseline_seconds: 0.0,
+            outcome: RetryOutcome::Passed,
+        };
+        assert_eq!(
+            left_out_message(&retry),
+            "Tests fail with the schema, perhaps because they read a.rs, b.rs, c.rs and 2 more: \
+            testing the 12 mutants in them and in p, whose crate roots they read, the classic way"
+        );
     }
 
     /// Look up environment variables in `vars`.

@@ -8,7 +8,7 @@
 #![warn(clippy::pedantic)]
 
 use std::collections::{BTreeSet, HashSet};
-use std::fs::{read_dir, read_to_string};
+use std::fs::{read_dir, read_to_string, remove_file};
 
 use anyhow::Context;
 use camino::{Utf8Path, Utf8PathBuf};
@@ -75,6 +75,23 @@ impl Markers {
         Ok(runs)
     }
 
+    /// Forget what processes that ran with no mutant active recorded, before the
+    /// baseline is run again with a different schema, so that [`Self::ran_in_baseline`]
+    /// only reports that run.
+    ///
+    /// Records of processes that ran without the mutant id are kept: the same tests run
+    /// again, and a build script that ran schema code might not run again.
+    pub(crate) fn clear_baseline_runs(&self) -> Result<()> {
+        for entry in read_dir(&self.path).with_context(|| format!("read {}", self.path))? {
+            let entry = entry?;
+            if entry.file_name().to_string_lossy().starts_with("baseline-") {
+                remove_file(entry.path())
+                    .with_context(|| format!("remove {}", entry.path().display()))?;
+            }
+        }
+        Ok(())
+    }
+
     /// The executables of processes that ran schema code without the mutant id
     /// variable, so ran the unmutated code whatever the mutant.
     pub(crate) fn env_cleared_executables(&self) -> Result<BTreeSet<String>> {
@@ -130,6 +147,19 @@ mod test {
                 processes: 3,
                 ran: HashSet::from([1, 2, 7, 9]),
             }
+        );
+    }
+
+    #[test]
+    fn markers_clear_baseline_runs_forgets_baseline_processes_only() {
+        let markers = Markers::new().unwrap();
+        write(markers.path().join("baseline-101"), "1 2 \n").unwrap();
+        write(markers.path().join("unset-100"), "/t/debug/tool").unwrap();
+        markers.clear_baseline_runs().unwrap();
+        assert_eq!(markers.ran_in_baseline().unwrap(), BaselineRuns::default());
+        assert_eq!(
+            markers.env_cleared_executables().unwrap(),
+            BTreeSet::from(["/t/debug/tool".to_owned()])
         );
     }
 }

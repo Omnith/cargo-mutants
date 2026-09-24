@@ -5,7 +5,7 @@
 
 #![warn(clippy::pedantic)]
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use camino::{Utf8Path, Utf8PathBuf};
 use itertools::Itertools;
@@ -134,6 +134,46 @@ pub(crate) struct DropSummary {
     pub unattributed: Vec<String>,
 }
 
+/// Files to leave out of the schema, so that tests that read them as text read their
+/// original text.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct LeaveOut {
+    /// Tree-relative paths, with `/` separators, of the files tests might read: their
+    /// mutants fall back.
+    pub files: BTreeSet<String>,
+    /// Packages some of whose crate roots tests might read. A crate root carries the
+    /// helper module that every embedded mutant of the crate needs, so it can't be
+    /// restored while any are embedded: all the package's mutants fall back.
+    pub packages: BTreeSet<String>,
+    /// Every crate root of `packages`, which no longer get the helper module.
+    pub roots: BTreeSet<Utf8PathBuf>,
+}
+
+impl LeaveOut {
+    /// Leave out `read_files`, and the packages of those that are crate roots, given
+    /// the package of each crate root that gets the helper module in `root_packages`.
+    pub(crate) fn new(
+        read_files: &BTreeSet<String>,
+        root_packages: &BTreeMap<Utf8PathBuf, String>,
+    ) -> LeaveOut {
+        let packages: BTreeSet<String> = root_packages
+            .iter()
+            .filter(|(root, _)| read_files.contains(&root.to_slash_path()))
+            .map(|(_, package)| package.clone())
+            .collect();
+        let roots = root_packages
+            .iter()
+            .filter(|(_, package)| packages.contains(*package))
+            .map(|(root, _)| root.clone())
+            .collect();
+        LeaveOut {
+            files: read_files.clone(),
+            packages,
+            roots,
+        }
+    }
+}
+
 /// All candidate mutants, and the schema files that embed them.
 #[derive(Debug)]
 pub(crate) struct Embedding {
@@ -142,6 +182,9 @@ pub(crate) struct Embedding {
     /// Crate roots that get the helper module, with their original text, keyed by
     /// tree-relative path.
     roots: BTreeMap<Utf8PathBuf, String>,
+    /// Crate roots in `roots` left out of the schema, which are rendered with their
+    /// original text, without the helper module.
+    left_out_roots: BTreeSet<Utf8PathBuf>,
     /// The text of the helper module.
     helper: String,
 }
@@ -201,6 +244,7 @@ impl Embedding {
             candidates,
             files,
             roots,
+            left_out_roots: BTreeSet::new(),
             helper: helper_module(
                 marker_dir.as_str(),
                 MutantId::try_from(n_mutants).expect("mutant count fits in u32"),
@@ -267,8 +311,11 @@ impl Embedding {
             candidates,
             files,
             roots,
+            left_out_roots,
             helper,
         } = self;
+        let gets_helper =
+            |path: &Utf8PathBuf| roots.contains_key(path) && !left_out_roots.contains(path);
         let mut rendered = Vec::with_capacity(files.len() + roots.len());
         for file in files.iter_mut() {
             let file_sites = sites(file.candidates.iter().filter_map(|&i| {
@@ -282,17 +329,54 @@ impl Embedding {
                 candidates[id as usize - 1].placement = Err(FallbackReason::OverlappingSite);
             }
             let mut text = file.schema.text.clone();
-            if roots.contains_key(&file.path) {
+            if gets_helper(&file.path) {
                 text.push_str(helper);
             }
             rendered.push((file.path.clone(), text));
         }
         for (path, code) in roots.iter() {
             if !files.iter().any(|file| &file.path == path) {
-                rendered.push((path.clone(), format!("{code}{helper}")));
+                let text = if gets_helper(path) {
+                    format!("{code}{helper}")
+                } else {
+                    code.clone()
+                };
+                rendered.push((path.clone(), text));
             }
         }
         rendered
+    }
+
+    /// Leave files that tests might read out of the schema, so that the next render
+    /// gives them their original text, returning the number of embedded mutants that
+    /// fell back.
+    ///
+    /// Embedded mutants in `leave_out.files` fall back as
+    /// [`FallbackReason::SourceReadByTests`], and the other embedded mutants of
+    /// `leave_out.packages` as [`FallbackReason::CrateRootReadByTests`]. Mutant ids
+    /// don't change.
+    pub(crate) fn leave_out(&mut self, leave_out: &LeaveOut) -> usize {
+        let mut moved = 0;
+        for candidate in &mut self.candidates {
+            if candidate.placement.is_err() {
+                continue;
+            }
+            let source_file = &candidate.mutant.source_file;
+            let reason = if leave_out
+                .files
+                .contains(&source_file.tree_relative_path.to_slash_path())
+            {
+                FallbackReason::SourceReadByTests
+            } else if leave_out.packages.contains(&source_file.package.name) {
+                FallbackReason::CrateRootReadByTests
+            } else {
+                continue;
+            };
+            candidate.placement = Err(reason);
+            moved += 1;
+        }
+        self.left_out_roots.extend(leave_out.roots.iter().cloned());
+        moved
     }
 
     /// The original text of every file that `render` returns, to restore the tree.
@@ -704,6 +788,109 @@ mod test {
                 dropped: 0,
                 unattributed: vec!["oops".to_owned()]
             }
+        );
+    }
+
+    /// The package of the mutants from `mutate_source_str`.
+    const PACKAGE: &str = "cargo-mutants-testdata-internal";
+
+    /// An embedding of `CODE` as `src/main.rs`, with another crate root without
+    /// mutants.
+    fn embedding_with_lib_root() -> Embedding {
+        let mutants = mutate_source_str(CODE, &Options::default()).unwrap();
+        Embedding::new(
+            mutants,
+            BTreeMap::from([("src/lib.rs".into(), "pub mod x;\n".to_owned())]),
+            &HashMap::new(),
+            MARKERS.into(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn leave_out_new_leaves_out_packages_whose_crate_roots_are_read_with_all_their_roots() {
+        let root_packages = BTreeMap::from([
+            (Utf8PathBuf::from("a/src/lib.rs"), "a".to_owned()),
+            (Utf8PathBuf::from("a/tests/t.rs"), "a".to_owned()),
+            (Utf8PathBuf::from("b/src/lib.rs"), "b".to_owned()),
+        ]);
+        let read_files = BTreeSet::from(["a/src/lib.rs".to_owned(), "b/src/gen.rs".to_owned()]);
+        assert_eq!(
+            LeaveOut::new(&read_files, &root_packages),
+            LeaveOut {
+                files: read_files.clone(),
+                packages: BTreeSet::from(["a".to_owned()]),
+                roots: BTreeSet::from(["a/src/lib.rs".into(), "a/tests/t.rs".into()]),
+            }
+        );
+    }
+
+    #[test]
+    fn leave_out_restores_read_file_and_falls_back_its_mutants_as_source_read_by_tests() {
+        let mut embedding = embedding_with_lib_root();
+        let moved = embedding.leave_out(&LeaveOut {
+            files: BTreeSet::from(["src/main.rs".to_owned()]),
+            ..LeaveOut::default()
+        });
+        assert_eq!(moved, 7);
+        assert_eq!(embedding.embedded().count(), 0);
+        assert!(
+            embedding
+                .fallback()
+                .all(|(_, reason)| reason == FallbackReason::SourceReadByTests)
+        );
+        let files = embedding.render();
+        assert_eq!(
+            files,
+            [
+                ("src/main.rs".into(), CODE.to_owned()),
+                (
+                    "src/lib.rs".into(),
+                    format!("pub mod x;\n{}", helper_module(MARKERS, 7))
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn leave_out_renders_crate_roots_of_left_out_packages_without_helper_module() {
+        let mut embedding = embedding_with_lib_root();
+        let moved = embedding.leave_out(&LeaveOut {
+            files: BTreeSet::from(["src/lib.rs".to_owned()]),
+            packages: BTreeSet::from([PACKAGE.to_owned()]),
+            roots: BTreeSet::from(["src/lib.rs".into()]),
+        });
+        assert_eq!(moved, 7);
+        assert!(
+            embedding
+                .fallback()
+                .all(|(_, reason)| reason == FallbackReason::CrateRootReadByTests)
+        );
+        assert_eq!(
+            embedding.render(),
+            [
+                ("src/main.rs".into(), CODE.to_owned()),
+                ("src/lib.rs".into(), "pub mod x;\n".to_owned()),
+            ]
+        );
+        assert_eq!(embedding.originals(), embedding.render());
+    }
+
+    #[test]
+    fn leave_out_keeps_the_reason_of_mutants_already_fallen_back() {
+        let mut embedding = embedding();
+        embedding.fall_back(1, FallbackReason::CompileError);
+        let moved = embedding.leave_out(&LeaveOut {
+            files: BTreeSet::from(["src/main.rs".to_owned()]),
+            ..LeaveOut::default()
+        });
+        assert_eq!(moved, 6);
+        assert_eq!(
+            embedding.fallback().map(|(_, reason)| reason).counts(),
+            HashMap::from([
+                (FallbackReason::CompileError, 1),
+                (FallbackReason::SourceReadByTests, 6)
+            ])
         );
     }
 

@@ -58,6 +58,14 @@ pub(crate) enum FallbackReason {
     CheckIterationsExhausted,
     /// Tests failed with the schema and no mutant active, but passed without it.
     SchemaChangesBehavior,
+    /// Tests failed with the schema and no mutant active, and the mutant is in a file
+    /// named by a string literal in a package, so tests might read its text: the file
+    /// was left out of the schema, so that tests read its original text.
+    SourceReadByTests,
+    /// Like [`FallbackReason::SourceReadByTests`], but tests might read a crate root
+    /// of the mutant's package, which carries the schema's helper module that every
+    /// embedded mutant of the crate needs, so the whole package was left out.
+    CrateRootReadByTests,
     /// The mutant was missed, but it's in a file named by a string literal in a
     /// package, so tests might read its text: with the schema they read the same
     /// text for every mutant, but the classic way they read the mutated text, which

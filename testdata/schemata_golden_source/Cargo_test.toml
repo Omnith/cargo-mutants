@@ -1,0 +1,22 @@
+# A workspace whose integration tests read source files as text, through a literal
+# path, and compare them with committed golden copies, as a test that checks
+# generated code is current might. The schema rewrites those files, so under
+# `cargo mutants --schemata` the tests fail with the schema and no mutant active.
+#
+# Since the paths are string literals, cargo-mutants knows which files the tests
+# read: it leaves them out of the schema, testing their mutants the classic way,
+# and embeds the rest.
+#
+# In `module_golden` the test reads a module, `src/table.rs`: only its mutants are
+# tested the classic way, and those of `src/lib.rs` stay embedded. In `root_golden`
+# the test reads the crate root, which carries the schema's helper module, so every
+# mutant of the package, including those of `src/shapes.rs`, is tested the classic
+# way.
+#
+# `double` and `area` are tested by calling them, so their mutants are caught.
+# `triple` is not tested, so its mutants are missed. The mutants of the files that
+# are read are caught by the golden comparison.
+
+[workspace]
+members = ["module_golden", "root_golden"]
+resolver = "2"

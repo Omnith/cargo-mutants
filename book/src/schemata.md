@@ -226,6 +226,27 @@ for example because a test reads its own source from a path built at runtime. If
 the tests fail on the unmutated tree too, cargo-mutants stops, as it does without
 schemata, and shows the output of the failing tests.
 
+If the tests fail with the schema, but some files are named by string literals, so
+that tests might read them (see [below](#mutants-tested-again-the-classic-way)),
+perhaps that's why: a test might compare a generated file with the output of the
+code generator, for example. Then cargo-mutants first leaves those files out of the
+schema, so that tests read their original text, rebuilds the schema without them,
+and runs the tests with no mutant selected once more. If they pass, the other
+mutants are tested with the schema, and the mutants in those files are tested the
+classic way afterwards, with the reason `source_read_by_tests`. A crate root can't
+be left out on its own, since it carries code that every embedded mutant of the
+crate needs, so if tests read a crate root, every mutant of its package is tested
+the classic way, with the reason `crate_root_read_by_tests`. cargo-mutants says
+which files it left out:
+
+```text
+ INFO Tests fail with the schema, perhaps because they read src/generated/metadata.rs: testing the 14 mutants in them the classic way
+```
+
+If the tests still fail, or no mutant is left embedded, every mutant is tested the
+classic way, as above. The rebuild and the second run are recorded as
+`baseline_retry` in `schemata.json` (see [Troubleshooting](#troubleshooting)).
+
 Every mutant is also tested the classic way if no test process records that it ran
 the tree's code with the mutant id in its environment. Each process that runs the
 schema's code with no mutant selected records this in a temporary directory, so this
@@ -276,7 +297,9 @@ back if:
   span make errors point elsewhere, so all the mutants in that file fall back;
 - they were missed, but their outcome might be different the classic way,
   because tests might read their file or some tests ran the tree's code without
-  the mutant id (see below).
+  the mutant id (see below);
+- the tests failed with the schema, and tests might read their file, or a crate
+  root of their package (see [above](#the-whole-run)).
 
 (Mutants that replace the `&&` of a let chain never compile, and are recorded as
 unviable.)
@@ -340,11 +363,12 @@ reason `environment_cleared` or `source_read_by_tests_missed_retest`.
   without mutants, or for mutants whose code doesn't run, but not interference
   that only happens with some mutants.
 - Tests that read source files see the schema. If they check text that the
-  schema changes, like the exact text of a function body, the baseline fails
-  and every mutant is tested the classic way; this also happens when the file is
-  named by a string literal. If the path isn't a string literal, for example
-  when it's built from `file!()` at runtime, missed mutants in that file aren't
-  tested again the classic way.
+  schema changes, like the exact text of a function body, the baseline fails.
+  If the file is named by a string literal, it's left out of the schema and its
+  mutants are tested the classic way (see [above](#the-whole-run)); if not, for
+  example when the path is built from `file!()` at runtime, every mutant is
+  tested the classic way. Nor are missed mutants in a file read through such a
+  path tested again the classic way.
 - A mutant caught with the schema might be missed the classic way if tests pass
   source text that the schema changes to the mutated code itself, as a parser
   or formatter might when it is tested on its own source: the mutated code then
@@ -434,6 +458,17 @@ mutant tested with the schema, `retested_unreached`,
 in those files), `baseline_processes` (the number of test processes that recorded
 running the tree's code with no mutant selected), and `ran_in_baseline_mutants`
 (the number of embedded mutants whose code ran then).
+
+If the tests failed with the schema and files that tests might read were left out
+of it, `baseline_retry` records the `files` and `packages` left out, the number of
+`mutants` that fell back, the cost (`failed_baseline_seconds`, `build_passes`,
+`build_seconds`, and `baseline_seconds`), and the `outcome`: `passed`,
+`schema_changes_behavior` or `failed` if the tests failed again with the schema or
+on the unmutated tree, `nothing_embedded` if no mutant was left, or
+`nothing_left_out` if no embedded mutant was in those files, so the baseline
+wasn't run again. `debug.log` has the same as a `schemata.baseline.retry` event.
+Only the second baseline's records of which code ran with no mutant selected are
+kept.
 
 The schema's check and build are a fixed cost, recorded in `schemata.json`
 (`check_seconds` and `build_seconds`) and in `mutants.out/debug.log` as a
