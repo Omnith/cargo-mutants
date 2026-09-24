@@ -50,7 +50,8 @@ The output directory contains:
 * With schemata, a `schemata.json` file recording how the mutants were built and
   tested: how many were built into the schema and how many were tested separately,
   and why, the passes that checked and built the schema, the timings of each step,
-  and, with coverage-based test selection, the tests chosen for each mutant. Like
+  whether coverage was collected and the estimates that decided it, and, with
+  coverage-based test selection, the tests chosen for each mutant. Like
   `outcomes.json`, it's replaced atomically.
 
 * With coverage-based test selection, `uncovered.txt`, listing the mutants reported

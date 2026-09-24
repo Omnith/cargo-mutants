@@ -87,8 +87,9 @@ pub struct Config {
     pub stop_tests_on_failure: Option<bool>,
     /// Run tests from these packages for all mutants.
     pub test_package: Vec<String>,
-    /// Which tests to run for each mutant built into a schema: `coverage` (the default)
-    /// runs only the tests that execute the mutated code; `all` runs all of them.
+    /// Which tests to run for each mutant built into a schema: `coverage` runs only the
+    /// tests that execute the mutated code; `all` runs all of them; `auto` (the default)
+    /// uses coverage if collecting it is expected to take less time than it saves.
     pub test_selection: Option<TestSelection>,
 
     /// Run tests from all packages in the workspace, not just the mutated package.

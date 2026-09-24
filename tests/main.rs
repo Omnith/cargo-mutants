@@ -4886,6 +4886,50 @@ fn test_selection_coverage_outcomes_match_classic_in_test_selection_coverage_tre
 }
 
 #[test]
+fn test_selection_auto_records_its_choice_and_matches_classic_in_test_selection_coverage_tree() {
+    if !llvm_tools_available(
+        "test_selection_auto_records_its_choice_and_matches_classic_in_test_selection_coverage_tree",
+    ) {
+        return;
+    }
+    let report = assert_schemata_outcomes_match_classic_with(
+        "test_selection_coverage",
+        &[],
+        &["--test-selection=auto"],
+        &[],
+    );
+    // On a tree this small both choices take about a second, so which one is made
+    // depends on timing; either way it's recorded with the measurements behind it.
+    let decision = &report["coverage_decision"];
+    let mutant_tests = report["mutant_tests"].as_array().unwrap();
+    assert_eq!(decision["mutants"], mutant_tests.len(), "{decision:#}");
+    // Three unit tests and one integration test pass in the baseline.
+    assert_eq!(decision["tests"], 4, "{decision:#}");
+    for field in ["mutant_seconds", "rebuild_seconds", "suite_seconds"] {
+        assert!(decision[field].as_f64().unwrap() > 0.0, "{decision:#}");
+    }
+    let collect = decision["collect"].as_bool().unwrap();
+    assert_eq!(
+        collect,
+        decision["saved_seconds"].as_f64() > decision["collect_seconds"].as_f64(),
+        "{decision:#}"
+    );
+    assert_eq!(
+        report["test_selection"]["collection"]["tests"]
+            .as_u64()
+            .is_some(),
+        collect,
+        "coverage is collected if and only if that was chosen"
+    );
+    assert!(
+        mutant_tests
+            .iter()
+            .all(|test| test["selection"].is_null() != collect),
+        "tests are selected for every mutant if and only if coverage was collected"
+    );
+}
+
+#[test]
 fn test_selection_coverage_outcomes_match_classic_in_schemata_tree() {
     if !llvm_tools_available("test_selection_coverage_outcomes_match_classic_in_schemata_tree") {
         return;
@@ -4912,10 +4956,10 @@ fn test_selection_coverage_instrumented_code_runs_only_while_collecting_coverage
     ) {
         return;
     }
-    // The instrumented build shares the target directory with the schema build, and
-    // fallback build directories are seeded from it. Coverage collection gives every
-    // process it runs its own LLVM_PROFILE_FILE; any other instrumented process would
-    // write its profile to the one inherited from here.
+    // The instrumented build is in a copy of the tree seeded from the schema's build
+    // directory, from which fallback build directories are also seeded. Coverage
+    // collection gives every process it runs its own LLVM_PROFILE_FILE; any other
+    // instrumented process would write its profile to the one inherited from here.
     let tmp = copy_of_testdata("test_selection_coverage");
     let out = tempdir().unwrap();
     let leaked = tempdir().unwrap();

@@ -71,8 +71,9 @@ test_tool = "cargo"
 schemata = true
 
 # With schemata, which tests to run for each mutant: "coverage" runs only the tests
-# that execute the mutated code (needs the llvm-tools rustup component), "all" runs all
-test_selection = "coverage"
+# that execute the mutated code (needs the llvm-tools rustup component), "all" runs all,
+# and "auto" (the default) uses coverage when collecting it is expected to save time
+test_selection = "auto"
 
 # Run tests from these specific packages for all mutants
 test_package = ["my-core-package", "my-utils"]

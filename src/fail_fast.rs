@@ -113,6 +113,13 @@ impl KnownTests {
     }
 }
 
+/// The number of tests that libtest reported as passing in `log`.
+pub fn passed_tests(log: &str) -> usize {
+    log.lines()
+        .filter(|line| result_line(line, "ok").is_some())
+        .count()
+}
+
 /// If `line` is libtest's report of a test with the given result, return the test name.
 ///
 /// libtest's default "pretty" format reports each test as `test NAME ... RESULT` on
@@ -602,6 +609,12 @@ mod test {
                 "src/lib.rs - f (line 3)"
             ])
         );
+    }
+
+    #[test]
+    fn passed_tests_counts_every_test_reported_ok() {
+        assert_eq!(passed_tests(BASELINE_LOG), 3);
+        assert_eq!(passed_tests(&BASELINE_LOG.repeat(2)), 6);
     }
 
     #[test]
