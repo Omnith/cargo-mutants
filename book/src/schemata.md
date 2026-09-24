@@ -29,15 +29,17 @@ The steps are:
 
 1. Decide which mutants can be embedded. The others *fall back* to being tested
    the classic way (see [below](#when-it-falls-back)).
-2. With coverage-based test selection, build the unmutated tree with coverage
-   instrumentation and record which tests execute which functions.
-3. Build the schema with `cargo test --no-run`. If it doesn't compile, drop the
+2. Build the schema with `cargo test --no-run`. If it doesn't compile, drop the
    mutants that the errors point to, and repeat.
-4. Run the tests with no mutant selected. This is the [baseline](baseline.md):
+3. Run the tests with no mutant selected. This is the [baseline](baseline.md):
    they must pass, as without schemata. The schema's build is the baseline's
    build phase, and `mutants.out/log/baseline.log` shows the build commands and
    everything the tests printed.
-5. Choose how many mutants to test at once.
+4. Choose how many mutants to test at once.
+5. Decide whether to use [coverage-based test
+   selection](#coverage-based-test-selection), and if so, build a copy of the
+   unmutated tree with coverage instrumentation and record which tests execute which
+   functions.
 6. Test each embedded mutant.
 7. Restore the original source and test the fallback mutants the classic way.
 
@@ -106,8 +108,10 @@ Fallback mutants are tested by `--jobs` workers, one by default.
 
 ### Coverage-based test selection
 
-By default, `--test-selection=coverage` runs only the tests that execute each
-mutant's code, rather than every test. It needs `llvm-profdata` and `llvm-cov`
+`--test-selection=coverage` runs only the tests that execute each mutant's code,
+rather than every test. By default, `--test-selection=auto` does this when
+collecting coverage is expected to take less time than it saves (see [choosing
+automatically](#choosing-automatically)). It needs `llvm-profdata` and `llvm-cov`
 matching the LLVM version of the rustc that builds the tree:
 
 ```sh
@@ -119,9 +123,11 @@ tree uses, including one chosen by a `rust-toolchain.toml` file. cargo-mutants
 looks for the tools in that toolchain's sysroot (`rustc --print sysroot`, run in
 the tree). Setting `LLVM_PROFDATA` and `LLVM_COV` to their paths overrides this.
 
-Before building the schema, cargo-mutants builds the unmutated tree with only the
-workspace's crates instrumented for coverage. Dependencies are not instrumented, so
-the schema build reuses them. Then it runs each test by itself, in parallel, and
+Once the schema is built and its baseline has passed, cargo-mutants copies the
+unmutated tree, seeding the copy's `target` directory from the schema's build
+directory (unless `--seed-target=false`), and builds it with only the workspace's
+crates instrumented for coverage. Dependencies are not instrumented, so they are
+reused, and the schema's own build is left as it is. Then it runs each test by itself, in parallel, and
 records which functions it executes, including in programs the test runs, such as
 `CARGO_BIN_EXE_*` binaries. Then each embedded mutant is tested in one of three ways:
 
@@ -179,9 +185,50 @@ That is the outcome all the tests would give, provided that:
 Mutants whose code a test might read as text are still tested again the classic way
 if they're missed, as described below.
 
-Collecting coverage is a fixed cost: on one crate it took about 70 seconds, and
-was repaid after about 8 caught mutants. For a handful of mutants, for example
-from a small [`--in-diff`](in-diff.md), `--test-selection=all` can be faster.
+#### Choosing automatically
+
+Collecting coverage is a fixed cost, which only pays off if there are enough
+mutants: for a handful of mutants, for example from a small
+[`--in-diff`](in-diff.md), running all the tests for each of them can be faster.
+So by default, with `--test-selection=auto`, cargo-mutants decides once the
+schema's baseline has passed and the number of mutants to test at once is chosen,
+from what it measured in this run:
+
+- Running all the tests for the embedded mutants would take the number of embedded
+  mutants times one run of the tests, as long as the run that chose how many
+  mutants to test at once took with that many at once, divided by that many. (With
+  tests of several packages, this is shared evenly among them.)
+- Coverage is expected to save 55% of that. Missed mutants still run all the tests,
+  and caught mutants stop at the first failed test even without coverage. (On one
+  crate, it saved 54% for 9 mutants and 58% for 91.)
+- Collecting coverage costs a rebuild of the workspace's crates with
+  instrumentation, and running each test alone. The rebuild is estimated from the
+  schema's build: its last build if it was built again after dropping mutants,
+  which rebuilt only the workspace's crates, or else the whole build, which also
+  built the dependencies, and so overestimates it. Building with instrumentation and
+  listing the tests is taken to be 1.4 times as long. Running the tests alone is
+  estimated at 0.1 second for each test that passed in the baseline, plus one run
+  of the tests, shared among the CPUs.
+
+Coverage is collected only if the expected saving is larger than the cost. For
+example, on a crate whose 818 tests take about 4 seconds, 10 mutants would take
+about 30 seconds with all the tests, which coverage would cut by about 16 seconds,
+but collecting it took 36 seconds, so it isn't collected; for 104 mutants it is,
+and cuts the run from about 5 minutes to 3.
+
+The decision is not printed. `mutants.out/schemata.json` records it as
+`coverage_decision`, with `collect` (whether coverage was collected), the measured
+inputs, and the estimates, such as `all_tests_seconds`, `saved_seconds`, and
+`collect_seconds`; `mutants.out/debug.log` has the same as a
+`schemata.coverage.decision` event.
+
+The estimate doesn't include copying the tree and its `target` directory, which
+is fast on filesystems that support reflinks, such as APFS and Btrfs, but a full
+copy elsewhere.
+
+To always collect coverage, pass `--test-selection=coverage`, or set
+`test_selection = "coverage"` in `.cargo/mutants.toml`; to never collect it, use
+`all`.
 
 `mutants.out/schemata.json` has a `test_selection` section with the time to collect
 coverage, the number of mutants tested each way and why all tests ran, the number of
@@ -264,9 +311,9 @@ These mutants are listed as fallback mutants with the reason
 
 ### Test selection
 
-If coverage-based test selection is the default but `llvm-profdata` and `llvm-cov`
-aren't found for the tree's toolchain, every embedded mutant runs all the tests,
-and cargo-mutants says so once:
+If `--test-selection` is `auto`, the default, or `coverage` from the config file,
+but `llvm-profdata` and `llvm-cov` aren't found for the tree's toolchain, every
+embedded mutant runs all the tests, and cargo-mutants says so once:
 
 ```text
  INFO Running all tests for each mutant: coverage-based test selection needs llvm-tools for this tree's toolchain (rustup component add llvm-tools)

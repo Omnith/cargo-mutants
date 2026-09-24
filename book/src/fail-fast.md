@@ -34,7 +34,7 @@ The rerun writes its output to `mutants.out/rerun/mutants.out`, within the run's
 
 A `--re` on the command line is combined with any `examine_re` in `.cargo/mutants.toml`, so if the config sets `examine_re`, the rerun also tests the mutants that it matches.
 
-The rerun still uses [schemata](schemata.md) and coverage-based test selection, so it runs the selected tests that execute the mutant's code, stopping at the first batch that fails. To see the output of the whole test suite exactly as building and testing that mutant by itself would show it, add `--no-schemata`; or, to keep schemata but run all the tests, add `--test-selection=all`.
+The rerun still uses [schemata](schemata.md). For one mutant, the default `--test-selection=auto` usually [finds](schemata.md#choosing-automatically) that collecting coverage wouldn't pay off, so the rerun runs all the tests; but if coverage-based test selection is used, as when `--test-selection=coverage` was given, it runs the selected tests that execute the mutant's code, stopping at the first batch that fails. To see the output of the whole test suite exactly as building and testing that mutant by itself would show it, add `--no-schemata`; or, to keep schemata but run all the tests, add `--test-selection=all`.
 
 Tests aren't stopped early:
 

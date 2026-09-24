@@ -1,11 +1,12 @@
 // Copyright 2026 Martin Pool
 
 //! Experimental coverage-based test selection for `--schemata`
-//! (`--test-selection=coverage`).
+//! (`--test-selection=coverage`, or `auto` when [`decision`] expects it to pay off).
 //!
-//! Before the schema is built, the unmutated tree is built with only the workspace's
-//! crates instrumented for coverage, and each test is run alone to learn which
-//! functions it executes (see [`collect`]). Then each mutant gets a [`Plan`]:
+//! Once the schema is built and its baseline has passed, a copy of the unmutated tree
+//! is built with only the workspace's crates instrumented for coverage, and each test
+//! is run alone to learn which functions it executes (see [`collect`]). Then each
+//! mutant gets a [`Plan`]:
 //!
 //! - If tests execute a function whose code spans the mutant, only those tests
 //!   run, fastest first, in batches that double in size, stopping at the first
@@ -26,6 +27,7 @@
 #![warn(clippy::pedantic)]
 
 pub(crate) mod collect;
+pub(crate) mod decision;
 mod listing;
 pub(crate) mod llvm;
 
@@ -427,17 +429,47 @@ pub(crate) fn batches(n: usize) -> Vec<Range<usize>> {
     batches
 }
 
-/// True if two runs of `cargo test` ran the same test binaries in the same order,
-/// so that command indexes in one refer to the same tests in the other.
+/// The paths by which a tree whose root is `root` may be named: `root`, and its
+/// canonical path if that's different, as Cargo reports it when `root` is reached
+/// through a symlink.
 ///
-/// Binaries are compared by package directory and file name without the hash.
-pub(crate) fn same_test_binaries(a: &[ReplayCommand], b: &[ReplayCommand]) -> bool {
-    fn identity(command: &ReplayCommand) -> (Option<&str>, &str) {
+/// This reads the filesystem, so it must be called while the tree exists.
+pub(crate) fn tree_roots(root: &Utf8Path) -> Vec<Utf8PathBuf> {
+    let mut roots = vec![root.to_owned()];
+    if let Ok(canonical) = root.canonicalize_utf8()
+        && canonical != root
+    {
+        roots.push(canonical);
+    }
+    roots
+}
+
+/// True if two runs of `cargo test`, `a` in a tree named by `a_roots` and `b` in
+/// one named by `b_roots` (see [`tree_roots`]), ran the same test binaries in the
+/// same order, so that command indexes in one refer to the same tests in the other.
+///
+/// Binaries are compared by package directory relative to the tree's root, and by
+/// file name without the hash.
+pub(crate) fn same_test_binaries(
+    a: &[ReplayCommand],
+    a_roots: &[Utf8PathBuf],
+    b: &[ReplayCommand],
+    b_roots: &[Utf8PathBuf],
+) -> bool {
+    fn identity<'c>(
+        command: &'c ReplayCommand,
+        roots: &[Utf8PathBuf],
+    ) -> (Option<&'c str>, &'c str) {
         let manifest_dir = command
             .env
             .iter()
             .find(|(key, _)| key == "CARGO_MANIFEST_DIR")
-            .map(|(_, value)| value.as_str());
+            .map(|(_, value)| {
+                roots
+                    .iter()
+                    .find_map(|root| Utf8Path::new(value).strip_prefix(root).ok())
+                    .map_or(value.as_str(), Utf8Path::as_str)
+            });
         let file_name = Utf8Path::new(&command.argv[0])
             .file_name()
             .unwrap_or_default();
@@ -450,7 +482,10 @@ pub(crate) fn same_test_binaries(a: &[ReplayCommand], b: &[ReplayCommand]) -> bo
         };
         (manifest_dir, target)
     }
-    a.len() == b.len() && a.iter().zip(b).all(|(a, b)| identity(a) == identity(b))
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(a, b)| identity(a, a_roots) == identity(b, b_roots))
 }
 
 /// True if the command runs doctests.
@@ -703,15 +738,58 @@ mod test {
             command("/ws/a", "/ws/target/mutants-coverage/debug/deps/a-2222"),
             command("/ws/a", "/rust/bin/rustdoc"),
         ];
-        assert!(same_test_binaries(&schema, &coverage));
-        assert!(!same_test_binaries(&schema, &coverage[..1]));
+        let ws = [Utf8PathBuf::from("/ws")];
+        assert!(same_test_binaries(&schema, &ws, &coverage, &ws));
+        assert!(!same_test_binaries(&schema, &ws, &coverage[..1], &ws));
         assert!(!same_test_binaries(
             &schema[..1],
-            &[command("/ws/b", "/ws/target/debug/deps/a-2222")]
+            &ws,
+            &[command("/ws/b", "/ws/target/debug/deps/a-2222")],
+            &ws
         ));
         assert!(!same_test_binaries(
             &schema[..1],
-            &[command("/ws/a", "/ws/target/debug/deps/b-1111")]
+            &ws,
+            &[command("/ws/a", "/ws/target/debug/deps/b-1111")],
+            &ws
+        ));
+    }
+
+    #[test]
+    fn same_test_binaries_compares_package_directories_relative_to_either_root_of_each_tree() {
+        // Cargo reports the canonical path of a tree whose root is given through a
+        // symlink, as a temporary directory on macOS is.
+        let schema_roots = [
+            Utf8PathBuf::from("/tmp/schema"),
+            Utf8PathBuf::from("/private/tmp/schema"),
+        ];
+        let coverage_roots = [
+            Utf8PathBuf::from("/tmp/coverage"),
+            Utf8PathBuf::from("/private/tmp/coverage"),
+        ];
+        let schema = [command(
+            "/private/tmp/schema/a",
+            "/private/tmp/schema/target/debug/deps/a-1111",
+        )];
+        let coverage = [command(
+            "/tmp/coverage/a",
+            "/tmp/coverage/target/debug/deps/a-2222",
+        )];
+        assert!(same_test_binaries(
+            &schema,
+            &schema_roots,
+            &coverage,
+            &coverage_roots
+        ));
+        let other_package = [command(
+            "/tmp/coverage/b",
+            "/tmp/coverage/target/debug/deps/a-2222",
+        )];
+        assert!(!same_test_binaries(
+            &schema,
+            &schema_roots,
+            &other_package,
+            &coverage_roots
         ));
     }
 

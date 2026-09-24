@@ -2,15 +2,17 @@
 
 //! Collect per-test coverage of the unmutated tree.
 //!
+//! This runs in a copy of the tree of its own, whose target directory is seeded from
+//! the schema's build directory once the schema is built. Dependencies are not
+//! instrumented, so they're reused, and only the workspace's crates are rebuilt; the
+//! schema's own build is not touched.
+//!
 //! For each package selection:
 //!
 //! 1. Run `cargo test -vv -- --list --format terse`, with cargo-mutants itself as
 //!    `RUSTC_WORKSPACE_WRAPPER` adding `-C instrument-coverage` to the workspace's
 //!    crates only. This builds the instrumented tests, and prints each test command
-//!    with its environment and the tests it contains. It uses the build directory's
-//!    usual target directory: dependencies are not instrumented, so the schema build
-//!    that follows reuses them, and rebuilds only the workspace's crates, as it would
-//!    anyway for the schema.
+//!    with its environment and the tests it contains.
 //! 2. Run each test alone, in parallel, with `LLVM_PROFILE_FILE` pointing into a
 //!    directory of its own, so that programs it runs, like `CARGO_BIN_EXE_*`
 //!    binaries, write their profiles there too. Convert its profiles to text with
@@ -41,7 +43,7 @@ use super::listing::{LIST_ARGS, listed_tests};
 use super::llvm::{executed_functions, instrumented_rustc_args, mapped_functions};
 use super::{
     CollectedRun, FunctionNames, Isolated, NameId, SelectionCoverage, TestCase, TestRun,
-    UnobservedFiles, runs_doctests,
+    UnobservedFiles, runs_doctests, tree_roots,
 };
 use crate::Result;
 use crate::cargo::cargo_argv;
@@ -196,12 +198,16 @@ pub(crate) struct Collected {
     pub key: Vec<String>,
     /// The test commands of the instrumented build, without the listing arguments.
     pub commands: Vec<ReplayCommand>,
+    /// The paths of the tree where the commands ran (see [`tree_roots`]).
+    pub roots: Vec<Utf8PathBuf>,
     pub coverage: SelectionCoverage,
 }
 
 /// Counts and timings of coverage collection, for `schemata.json`.
 #[derive(Debug, Default, Clone, Serialize)]
 pub(crate) struct CollectionReport {
+    /// Copying the tree to collect coverage in, seeding its target directory.
+    pub copy_seconds: f64,
     /// Building the instrumented tests and listing them.
     pub build_and_list_seconds: f64,
     /// Running each test alone and reading its profile.
@@ -245,6 +251,11 @@ impl CollectionReport {
     }
 }
 
+/// The number of tests run alone at once while collecting coverage.
+pub(crate) fn isolated_workers() -> usize {
+    thread::available_parallelism().map_or(1, usize::from)
+}
+
 /// Collect coverage for each selection, in the runner's build directory, which must
 /// hold the unmutated source.
 pub(crate) fn collect(
@@ -270,9 +281,10 @@ pub(crate) fn collect(
         Some(scratch)
     };
     let mut report = CollectionReport {
-        workers: thread::available_parallelism().map_or(1, usize::from),
+        workers: isolated_workers(),
         ..CollectionReport::default()
     };
+    let roots = tree_roots(build_dir);
     let mut collected = Vec::new();
     for (index, selection) in selections.iter().enumerate() {
         let selection_dir = scratch_dir.join(format!("selection-{index}"));
@@ -324,6 +336,7 @@ pub(crate) fn collect(
         collected.push(Collected {
             key,
             commands,
+            roots: roots.clone(),
             coverage,
         });
     }
@@ -665,12 +678,7 @@ fn map_functions(
     if !stderr.trim().is_empty() {
         debug!(%stderr, "llvm-cov export warnings");
     }
-    let mut roots = vec![root.to_owned()];
-    if let Ok(canonical) = root.canonicalize_utf8()
-        && canonical != root
-    {
-        roots.push(canonical);
-    }
+    let roots = tree_roots(root);
     let json = String::from_utf8(output.stdout).context("llvm-cov export output is not UTF-8")?;
     let functions = mapped_functions(&json, &roots).context("parse llvm-cov export output")?;
     if functions.is_empty() {

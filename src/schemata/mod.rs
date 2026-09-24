@@ -21,12 +21,16 @@
 //!    pass.
 //! 5. Choose how many mutants to test at once: `--jobs`, or else by timing concurrent
 //!    runs of the tests (see [`jobs`]). Either way, check that concurrent runs pass.
-//! 6. Test each embedded mutant, in parallel, all in the same build directory, by
+//! 6. With `--test-selection=coverage`, or `auto` if the measured costs so far say
+//!    it will save time (see [`coverage::decision`]), collect coverage of the
+//!    unmutated tree in a copy of it seeded from the build directory, to select each
+//!    mutant's tests (see [`coverage`]).
+//! 7. Test each embedded mutant, in parallel, all in the same build directory, by
 //!    replaying those commands with the mutant's id, or if they couldn't be replayed,
 //!    by running `cargo test`. Missed mutants whose outcome might differ the classic
 //!    way, because tests might read their file's text or ran code without the id,
 //!    become fallback mutants.
-//! 7. Restore the original source and test the fallback mutants the classic way.
+//! 8. Restore the original source and test the fallback mutants the classic way.
 //!
 //! Timing and counts are written to `mutants.out/schemata.json`.
 
@@ -56,13 +60,17 @@ use jiff::Timestamp;
 use serde::Serialize;
 use tracing::{debug, error, info, warn};
 
-use self::coverage::collect::{CollectionReport, LlvmTools, collect};
-use self::coverage::{Confirm, FullSuiteReason, Plan, UnobservedFiles, same_test_binaries};
+use self::coverage::collect::{Collected, CollectionReport, LlvmTools, collect, isolated_workers};
+use self::coverage::decision::{CostInputs, Decision, decide, mutant_seconds, rebuild_seconds};
+use self::coverage::{
+    Confirm, FullSuiteReason, Plan, UnobservedFiles, same_test_binaries, tree_roots,
+};
 use self::embed::{Blame, Embedding, LeaveOut, proven_unviable};
 use self::jobs::Probe;
 use self::markers::Markers;
 use self::plan::FallbackReason;
 use self::reads::named_files;
+use self::replay::ReplayCommand;
 use self::run::{Baseline, MutantTest, Pass, Runner, Selector, TestExec, Tested, Work};
 use crate::build_dir::BuildDir;
 use crate::console::Console;
@@ -362,7 +370,12 @@ struct Report {
     baseline_processes: usize,
     /// Embedded mutants whose code the schema recorded running in the baseline.
     ran_in_baseline_mutants: usize,
-    /// With `--test-selection=coverage`, how tests were selected.
+    /// With `--test-selection=auto` and llvm-tools, the estimated costs that decided
+    /// whether to collect coverage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    coverage_decision: Option<Decision>,
+    /// If coverage was collected, or its collection was attempted, how tests were
+    /// selected.
     #[serde(skip_serializing_if = "Option::is_none")]
     test_selection: Option<SelectionSummary>,
 }
@@ -665,18 +678,23 @@ pub(crate) fn test_mutants(
         bail!("--schemata can't be used with {option}");
     }
     let env_settings = EnvSettings::from_env();
-    let llvm_tools = if options.test_selection.value == TestSelection::Coverage {
-        match LlvmTools::find(workspace.root()) {
+    let test_selection = options.test_selection;
+    let llvm_tools = match test_selection.value {
+        TestSelection::All => None,
+        TestSelection::Coverage | TestSelection::Auto => match LlvmTools::find(workspace.root()) {
             Ok(tools) => Some(tools),
-            Err(err) if options.test_selection.on_command_line => return Err(err),
+            Err(err)
+                if test_selection.on_command_line
+                    && test_selection.value == TestSelection::Coverage =>
+            {
+                return Err(err);
+            }
             Err(err) => {
                 debug!("LLVM tools not found: {err:#}");
                 info!("{LLVM_TOOLS_NOT_FOUND}");
                 None
             }
-        }
-    } else {
-        None
+        },
     };
     let EnvSettings {
         confirm,
@@ -700,9 +718,6 @@ pub(crate) fn test_mutants(
         start_time: Some(Timestamp::now()),
         mutants: mutants.len(),
         jobs: options.jobs.unwrap_or(1),
-        test_selection: llvm_tools
-            .as_ref()
-            .map(|_| SelectionSummary::new(confirm, unobserved_files)),
         ..Report::default()
     };
     let tests_for_mutant = TestsForMutant::new(options, workspace);
@@ -746,31 +761,6 @@ pub(crate) fn test_mutants(
             .unique_by(|p| p.name.clone())
             .collect(),
     );
-    // Coverage is collected before the schema is written, from the unmutated source.
-    let collected = if let Some(tools) = &llvm_tools {
-        let summary = report.test_selection.as_mut().expect("selection summary");
-        let initial_selections = distinct_selections(&embedding, &tests_for_mutant, options);
-        debug!(
-            selections = initial_selections.len(),
-            "schemata.coverage.collect.start"
-        );
-        match collect(&runner, &initial_selections, tools, unobserved_files) {
-            Ok((collected, collection)) => {
-                summary.collection = Some(collection);
-                collected
-            }
-            Err(err) => {
-                crate::interrupt::check_interrupted()?;
-                warn!("Could not collect coverage; running all tests for every mutant: {err:#}");
-                summary.collection_error = Some(format!("{err:#}"));
-                Vec::new()
-            }
-        }
-    } else {
-        Vec::new()
-    };
-    report.write(&output_path);
-
     let check_phase = env_settings.check_phase;
     report.check_phase = check_phase.to_string();
     report.check_passes = runner.drop_until_clean(
@@ -975,19 +965,6 @@ pub(crate) fn test_mutants(
         .iter()
         .map(|s| crate::cargo::cargo_argv(s, Phase::Test, options))
         .collect_vec();
-    let selector = llvm_tools.as_ref().map(|_| Selector {
-        coverage: selection_keys
-            .iter()
-            .enumerate()
-            .map(|(index, key)| usable_coverage(&collected, key, &exec, index))
-            .collect(),
-        confirm,
-    });
-    if let (Some(selector), Some(summary)) = (&selector, report.test_selection.as_mut()) {
-        summary.selections_with_coverage = selector.coverage.iter().flatten().count();
-        summary.selections_without_coverage =
-            selector.coverage.len() - summary.selections_with_coverage;
-    }
     // Tests might read the text of these files: with the schema it's the same for
     // every mutant, so a caught mutant was caught by its behavior, as it would be the
     // classic way; but the classic way the mutated text is read, which might make
@@ -1005,20 +982,13 @@ pub(crate) fn test_mutants(
                 .read_files
                 .contains(&mutant.source_file.tree_relative_path.to_slash_path())
                 .then_some(FallbackReason::SourceReadByTestsMissedRetest);
-            let plan = selector
-                .as_ref()
-                .map(|selector| match selector.coverage[selection] {
-                    Some(coverage) => {
-                        coverage.plan(&mutant.source_file.tree_relative_path, mutant.span)
-                    }
-                    None => Plan::FullSuite(FullSuiteReason::NoCoverage),
-                });
             Work {
                 id,
                 mutant: mutant.clone(),
                 selection,
                 classic_if_missed,
-                plan,
+                // Known once coverage is collected, if it is.
+                plan: None,
                 // Known once the baseline's runs are finished.
                 ran_in_baseline: false,
             }
@@ -1041,15 +1011,24 @@ pub(crate) fn test_mutants(
     // many run at once, before relying on it. Without --jobs, the number is chosen by
     // running increasing numbers of copies at once, which checks the same.
     let embedded_selections = &selections[..embedded_selections];
+    // A timed run of the tests in as many copies at once as `--jobs` says.
+    let mut jobs_run = None;
     let concurrent_passed = if let Some(jobs) = options.jobs {
         report.test_jobs = jobs.clamp(1, work.len().max(1));
         if report.test_jobs > 1 {
-            Some(runner.concurrent_baseline(
+            let start = Instant::now();
+            let passed = runner.concurrent_baseline(
                 embedded_selections,
                 &exec,
                 report.test_jobs,
                 timeouts.test,
-            )?)
+            )?;
+            jobs_run = Some(Probe {
+                jobs: report.test_jobs,
+                seconds: start.elapsed().as_secs_f64(),
+                passed,
+            });
+            Some(passed)
         } else {
             None
         }
@@ -1111,6 +1090,78 @@ pub(crate) fn test_mutants(
         mutants = report.ran_in_baseline_mutants,
         "schemata.baseline.ran"
     );
+
+    // Coverage is collected only now, once the costs it's weighed against are known:
+    // how long the tests and the build take, and how many mutants there are.
+    let replay_commands = match &exec {
+        TestExec::Direct(commands) => Some(commands),
+        TestExec::CargoTest => None,
+    };
+    let collect_coverage = match (&llvm_tools, replay_commands, test_selection.value) {
+        (None, _, _) | (_, _, TestSelection::All) => false,
+        (Some(_), None, _) => {
+            warn!("Coverage-based test selection needs replayed test commands; running all tests");
+            false
+        }
+        (Some(_), Some(_), TestSelection::Coverage) => true,
+        (Some(_), Some(_), TestSelection::Auto) => {
+            let decision = decide(cost_inputs(
+                &report,
+                work.len(),
+                jobs_run.as_ref(),
+                embedded_selections.len(),
+                &baseline_logs,
+            )?);
+            decision.trace();
+            report.coverage_decision = Some(decision);
+            decision.collect
+        }
+    };
+    let collected = match (&llvm_tools, collect_coverage) {
+        (Some(tools), true) => {
+            let mut summary = SelectionSummary::new(confirm, unobserved_files);
+            let collected = collect_in_copy(
+                &runner,
+                workspace,
+                embedded_selections,
+                tools,
+                &mut summary,
+                unobserved_files,
+            )?;
+            report.test_selection = Some(summary);
+            Some(collected)
+        }
+        _ => None,
+    };
+    report.write(&output_path);
+    let build_roots = tree_roots(build_dir.path());
+    let selector = collected
+        .as_ref()
+        .zip(replay_commands)
+        .map(|(collected, commands)| Selector {
+            coverage: selection_keys
+                .iter()
+                .zip(commands)
+                .map(|(key, commands)| usable_coverage(collected, key, commands, &build_roots))
+                .collect(),
+            confirm,
+        });
+    if let Some(selector) = &selector {
+        for item in &mut work {
+            item.plan = Some(match selector.coverage[item.selection] {
+                Some(coverage) => coverage.plan(
+                    &item.mutant.source_file.tree_relative_path,
+                    item.mutant.span,
+                ),
+                None => Plan::FullSuite(FullSuiteReason::NoCoverage),
+            });
+        }
+        if let Some(summary) = report.test_selection.as_mut() {
+            summary.selections_with_coverage = selector.coverage.iter().flatten().count();
+            summary.selections_without_coverage =
+                selector.coverage.len() - summary.selections_with_coverage;
+        }
+    }
 
     if selector.is_some() {
         let plans = work
@@ -1249,20 +1300,108 @@ fn test_all_classically(
     outcome
 }
 
+/// Collect coverage of the unmutated tree for `selections`, recording how it went in
+/// `summary`.
+///
+/// It's collected in a copy of the source tree whose target directory is seeded from
+/// the schema's build directory, unless `--seed-target=false`, so that the
+/// dependencies are reused and the schema's build is left as it is.
+///
+/// If coverage can't be collected, this warns and returns none, so that every
+/// mutant runs all the tests.
+fn collect_in_copy(
+    runner: &Runner,
+    workspace: &Workspace,
+    selections: &[PackageSelection],
+    tools: &LlvmTools,
+    summary: &mut SelectionSummary,
+    unobserved_files: UnobservedFiles,
+) -> Result<Vec<Collected>> {
+    debug!(
+        selections = selections.len(),
+        "schemata.coverage.collect.start"
+    );
+    let copy_and_collect = || -> Result<(Vec<Collected>, CollectionReport)> {
+        let start = Instant::now();
+        let options = runner.options;
+        let seed = runner
+            .build_dir
+            .target_dir_for_seeding()
+            .filter(|_| options.seed_target);
+        let build_dir = match seed {
+            Some(seed) => BuildDir::copy_seeded(workspace.root(), &seed, options, runner.console)?,
+            None => BuildDir::copy_from(workspace.root(), options, runner.console)?,
+        };
+        let copy_seconds = start.elapsed().as_secs_f64();
+        let coverage_runner = Runner {
+            build_dir: &build_dir,
+            exclusive: RwLock::new(()),
+            ..*runner
+        };
+        let (collected, mut collection) =
+            collect(&coverage_runner, selections, tools, unobserved_files)?;
+        collection.copy_seconds = copy_seconds;
+        collection.total_seconds += copy_seconds;
+        Ok((collected, collection))
+    };
+    match copy_and_collect() {
+        Ok((collected, collection)) => {
+            summary.collection = Some(collection);
+            Ok(collected)
+        }
+        Err(err) => {
+            crate::interrupt::check_interrupted()?;
+            warn!("Could not collect coverage; running all tests for every mutant: {err:#}");
+            summary.collection_error = Some(format!("{err:#}"));
+            Ok(Vec::new())
+        }
+    }
+}
+
+/// The measured costs that decide whether to collect coverage for `mutants`
+/// embedded mutants, once the baseline, which wrote `baseline_logs`, has passed and
+/// the number of mutants to test at once is chosen: by probing, or with `--jobs`,
+/// timed in `jobs_run`.
+fn cost_inputs(
+    report: &Report,
+    mutants: usize,
+    jobs_run: Option<&Probe>,
+    selections: usize,
+    baseline_logs: &[Utf8PathBuf],
+) -> Result<CostInputs> {
+    let suite_seconds = report
+        .direct_baseline_test_seconds
+        .unwrap_or(report.baseline_test_seconds);
+    let concurrent = report
+        .jobs_probe
+        .iter()
+        .chain(jobs_run)
+        .find(|run| run.jobs == report.test_jobs && run.passed);
+    let tests = baseline_logs.iter().try_fold(0, |sum, log| {
+        let text = read_to_string(log).with_context(|| format!("read {log}"))?;
+        anyhow::Ok(sum + crate::fail_fast::passed_tests(&text))
+    })?;
+    Ok(CostInputs {
+        mutants,
+        mutant_seconds: mutant_seconds(concurrent, suite_seconds, selections),
+        rebuild_seconds: rebuild_seconds(&report.check_passes, &report.build_passes),
+        tests,
+        suite_seconds,
+        workers: isolated_workers(),
+    })
+}
+
 /// The coverage collected for the selection with cargo test command line `key`, if
-/// its test binaries match the commands replayed for the schema.
+/// its test binaries match `commands`, those replayed for the schema, in the tree
+/// named by `roots`.
 fn usable_coverage<'a>(
-    collected: &'a [coverage::collect::Collected],
+    collected: &'a [Collected],
     key: &[String],
-    exec: &TestExec,
-    index: usize,
+    commands: &[ReplayCommand],
+    roots: &[Utf8PathBuf],
 ) -> Option<&'a coverage::SelectionCoverage> {
     let found = collected.iter().find(|c| c.key == key)?;
-    let TestExec::Direct(commands) = exec else {
-        warn!("Coverage-based test selection needs replayed test commands; running all tests");
-        return None;
-    };
-    if same_test_binaries(&found.commands, &commands[index]) {
+    if same_test_binaries(&found.commands, &found.roots, commands, roots) {
         Some(&found.coverage)
     } else {
         warn!(

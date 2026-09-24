@@ -338,11 +338,13 @@ pub struct Args {
     #[arg(long, overrides_with = "schemata", help_heading = "Execution")]
     no_schemata: bool,
 
-    /// With schemata, which tests to run for each mutant [default: coverage].
+    /// With schemata, which tests to run for each mutant [default: auto].
     ///
     /// `coverage` runs only the tests that execute the mutated code, according to
     /// coverage of the unmutated tree, and needs the llvm-tools rustup component; without
-    /// it, all tests run. `all` runs all the tests.
+    /// it, all tests run. `all` runs all the tests. `auto` collects coverage only if,
+    /// from the measured build and test times and the number of mutants, that's expected
+    /// to take less time than it saves.
     #[arg(long, value_enum, help_heading = "Execution")]
     test_selection: Option<TestSelection>,
 

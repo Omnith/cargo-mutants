@@ -290,6 +290,9 @@ pub enum TestSelection {
     /// With schemata: only the tests that execute the mutated code, according to
     /// coverage collected from the unmutated tree.
     Coverage,
+    /// With schemata: coverage-based selection if collecting coverage is expected to
+    /// take less time than it saves, or else all the tests.
+    Auto,
 }
 
 /// Should ANSI colors be drawn?
@@ -456,7 +459,7 @@ impl Options {
             test_selection: Choice::resolve(
                 args.test_selection,
                 config.test_selection,
-                TestSelection::Coverage,
+                TestSelection::Auto,
             ),
         };
         if let Some(jobs) = options.jobs
@@ -1041,15 +1044,41 @@ mod test {
     }
 
     #[test]
-    fn test_selection_coverage_by_default() {
+    fn test_selection_auto_by_default() {
         let options = Options::from_arg_strs(["mutants"]);
         assert_eq!(
             options.test_selection,
             Choice {
-                value: TestSelection::Coverage,
+                value: TestSelection::Auto,
                 on_command_line: false
             }
         );
+    }
+
+    #[test]
+    fn test_selection_from_command_line_and_config_accepts_auto_coverage_and_all() {
+        for (name, value) in [
+            ("auto", TestSelection::Auto),
+            ("coverage", TestSelection::Coverage),
+            ("all", TestSelection::All),
+        ] {
+            assert_eq!(
+                Options::from_arg_strs(["mutants", &format!("--test-selection={name}")])
+                    .test_selection,
+                Choice {
+                    value,
+                    on_command_line: true
+                }
+            );
+            let config = format!("test_selection = \"{name}\"");
+            assert_eq!(
+                Options::from_arg_strs_and_config(["mutants"], &config).test_selection,
+                Choice {
+                    value,
+                    on_command_line: false
+                }
+            );
+        }
     }
 
     #[test]
