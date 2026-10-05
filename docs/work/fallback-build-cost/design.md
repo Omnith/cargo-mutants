@@ -316,8 +316,10 @@ message names the full disk and the phase's log. A gate that checks its populati
 outcomes then fails on the partial run as well.
 
 The check covers the classic lab's check and build phases (`run_cargo`) and the schemata runner's
-steps (`Runner::run_step`), which runs the schema's check and build and the coverage build. It
-does not cover the test phase. A test's own output can carry that text, for example a test of
+check and build steps (`Runner::run_step` with `Phase::Check` or `Phase::Build`). This section said
+it also covered the coverage build, which was wrong: that build runs through `run_step` as
+`Phase::Test`. A failed coverage build turns test selection off. It does not change a mutant's
+outcome. The check does not cover the test phase. A test's own output can carry that text, for example a test of
 disk-full handling, and a test that fails is a caught mutant by definition.
 
 **The first fallback build in each build directory is a full build of the workspace packages.**
