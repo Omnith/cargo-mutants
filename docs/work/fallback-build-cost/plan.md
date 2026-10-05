@@ -51,7 +51,8 @@ cd ~/repos/cargo-mutants-wt-fbc && graft build
 
 **Git.**
 - No tree-wide git: no `stash`, `clean`, `checkout --`, `reset`, `restore`.
-- Commit with `git commit -m '<msg>' -- <paths>`. List every path.
+- Commit with `git commit -m '<msg>' -- <paths>`. List every path. A new file needs
+  `git add <path>` first: `git commit -- <path>` refuses a path git does not know.
 - Commit messages follow this repository's own style: a plain sentence in the imperative, for
   example `Remove inherited incremental switches in scratch build dirs`. No Co-Authored-By.
 
@@ -221,6 +222,8 @@ then `command.envs(...)` over `set`, before `stdin`. Keep the debug span unchang
   - `run_cargo` passes `&Env { set: build_dir_cargo_env(...), remove: Vec::new() }` for now.
   - `Runner::cargo_env` and `Runner::test_env` keep returning `Vec<(String, String)>` for now.
     `run_step` and `run_test_command` wrap theirs. Task 2 changes the return types.
+  - The `cargo test` path in `run.rs` near `:999` passes `&self.test_env(id)`. Wrap it the same
+    way.
   - `collect.rs` `:512` wraps its `env`.
 
 - [ ] **Step 5: run the three tests and watch them pass.**
@@ -303,7 +306,8 @@ fn mutant_logs(mutants_out: &Path) -> Vec<String> {
 
 /// With incremental compilation turned off in the environment, as a CI job or a shell
 /// might turn it off to save disk, each scratch build dir still builds incrementally:
-/// it rebuilds the mutated package once per mutant.
+/// it rebuilds the mutated package once per mutant. With `-j2` the second build dir is
+/// seeded from the first, so the seeded copy is covered too.
 #[test]
 fn incremental_switches_from_environment_are_not_inherited_by_build_dirs() {
     let tmp = copy_of_testdata("small_well_tested");
@@ -311,7 +315,7 @@ fn incremental_switches_from_environment_are_not_inherited_by_build_dirs() {
     run()
         .env("CARGO_INCREMENTAL", "0")
         .env("CARGO_BUILD_INCREMENTAL", "false")
-        .args(["mutants", "--no-times", "--no-schemata", "-d"])
+        .args(["mutants", "--no-times", "--no-schemata", "-j2", "-d"])
         .arg(tmp.path())
         .arg("-o")
         .arg(out.path())
@@ -562,6 +566,9 @@ fn copy_tree_with_copy_target_skips_incremental_caches_beside_fingerprints() -> 
     write(tmp.join("target/debug/.fingerprint/foo-1234/lib-foo"), "fingerprint")?;
     create_dir_all(tmp.join("target/debug/incremental/foo-1234"))?;
     write(tmp.join("target/debug/incremental/foo-1234/cache"), "cache")?;
+    // A test's own scratch directory that happens to be called `incremental`.
+    create_dir_all(tmp.join("target/tmp/x/incremental"))?;
+    write(tmp.join("target/tmp/x/incremental/data"), "test data")?;
     write(tmp.join("Cargo.toml"), "[package]\nname = a")?;
     create_dir(tmp.join("src"))?;
     write(tmp.join("src/main.rs"), "fn main() {}")?;
@@ -572,6 +579,7 @@ fn copy_tree_with_copy_target_skips_incremental_caches_beside_fingerprints() -> 
 
     assert!(!dest.join("target/debug/incremental").exists());
     assert!(dest.join("target/debug/.fingerprint/foo-1234/lib-foo").is_file());
+    assert!(dest.join("target/tmp/x/incremental/data").is_file());
     Ok(())
 }
 ```
@@ -692,7 +700,20 @@ Change the test's `.assert().success();` to capture the output, and add:
 
 where `let assert = run()...timeout(OUTER_TIMEOUT).assert().success();`.
 
-- [ ] **Step 3: watch them fail.**
+- [ ] **Step 3: keep the other integration tests hermetic.** The new console line goes to
+  stderr whenever `CARGO_INCREMENTAL` or `CARGO_BUILD_INCREMENTAL` is set. Eight existing tests
+  assert an empty or exact stderr, and the fork's CI sets `CARGO_INCREMENTAL: 0`
+  (`.github/workflows/tests.yml:39`). The plan's review demonstrated the 8 failures. In
+  `tests/integration_util/mod.rs` `run()`, add both names to the filter of stripped variables,
+  beside `GITHUB_ACTION`, and extend the comment above it:
+
+```rust
+    // Also strip CARGO_INCREMENTAL and CARGO_BUILD_INCREMENTAL, which cargo-mutants
+    // reports on the console when it removes them in build dirs. Tests about them set
+    // them explicitly.
+```
+
+- [ ] **Step 4: watch the new tests fail.**
 
 ```
 cargo nextest run --all-features -E 'test(/env_overrides_/) | test(/incremental_switches_from_environment_are_not_inherited_by_schemata_build/)'
@@ -701,7 +722,7 @@ cargo nextest run --all-features -E 'test(/env_overrides_/) | test(/incremental_
 Expected: 3 run. The unit tests fail to compile on `env_overrides`. The integration test fails on
 `removed_env` being `null`.
 
-- [ ] **Step 4: implement** in `src/cargo.rs`, beside `REMOVED_IN_BUILD_DIRS`:
+- [ ] **Step 5: implement** in `src/cargo.rs`, beside `REMOVED_IN_BUILD_DIRS`:
 
 ```rust
 /// Variables that a scratch build dir overrides with its own value.
@@ -757,13 +778,13 @@ In `src/schemata/mod.rs`, add to `Report`:
 and set it at construction from
 `env_overrides(options, |name| env::var(name).ok()).removed`.
 
-- [ ] **Step 5: watch them pass.** Same command. Expected: 3 passed.
+- [ ] **Step 6: watch them pass.** Same command. Expected: 3 passed.
 
-- [ ] **Step 6: commit.**
+- [ ] **Step 7: commit.**
 
 ```
 cargo fmt && cargo clippy --all-targets --all-features -- -D warnings
-git commit -m 'Report the build dirs environment overrides once per run' -- src/cargo.rs src/main.rs src/schemata/mod.rs tests/main.rs
+git commit -m 'Report the build dirs environment overrides once per run' -- src/cargo.rs src/main.rs src/schemata/mod.rs tests/main.rs tests/integration_util/mod.rs
 ```
 
 ---
@@ -798,7 +819,22 @@ fn ran_out_of_disk_does_not_match_a_compile_error_or_nothing() {
     ));
     assert!(!ran_out_of_disk(""));
 }
+
+/// A compile error quotes source lines. cargo-mutants' own source holds the message as a
+/// literal, and its CI runs cargo-mutants on itself.
+#[test]
+fn ran_out_of_disk_does_not_match_a_quoted_source_line() {
+    assert!(!ran_out_of_disk(indoc! {r#"
+        error[E0308]: mismatched types
+          --> src/cargo.rs:30:5
+           |
+        30 |     "No space left on device",
+           |     ^^^^^^^^^^^^^^^^^^^^^^^^^ expected `u8`, found `&str`
+    "#}));
+}
 ```
+
+Add `use indoc::indoc;` to the test module if it is not there. `indoc` is already a dependency.
 
 - [ ] **Step 2: create the testdata tree.**
 
@@ -829,7 +865,10 @@ use std::process::exit;
 
 fn main() {
     println!("cargo:rerun-if-changed=src/lib.rs");
-    let source = read_to_string("src/lib.rs").expect("read src/lib.rs");
+    // A Windows checkout can have CRLF line endings.
+    let source = read_to_string("src/lib.rs")
+        .expect("read src/lib.rs")
+        .replace("\r\n", "\n");
     if !source.contains("\n    x * 2\n") {
         eprintln!("error: No space left on device (os error 28)");
         exit(1);
@@ -858,26 +897,32 @@ mod test {
 ```rust
 /// A build that fails because the disk is full stops the run with an error, rather than
 /// recording the mutant as unviable: a full disk must not hide a missed mutant.
+fn assert_disk_full_stops_the_run(schemata: &str) {
+    let tmp = copy_of_testdata("disk_full_build");
+    let out = tempdir().unwrap();
+    let assert = run()
+        .args(["mutants", "--no-times", schemata, "-d"])
+        .arg(tmp.path())
+        .arg("-o")
+        .arg(out.path())
+        .timeout(OUTER_TIMEOUT)
+        .assert()
+        .failure();
+    let output = String::from_utf8_lossy(&assert.get_output().stdout).into_owned()
+        + &String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(output.contains("the disk is full"), "{output}");
+    let unviable = read_to_string(out.path().join("mutants.out/unviable.txt")).unwrap_or_default();
+    assert_eq!(unviable, "");
+}
+
 #[test]
-fn a_build_that_runs_out_of_disk_stops_the_run_in_disk_full_build_tree() {
-    for schemata in ["--no-schemata", "--schemata"] {
-        let tmp = copy_of_testdata("disk_full_build");
-        let out = tempdir().unwrap();
-        let assert = run()
-            .args(["mutants", "--no-times", schemata, "-d"])
-            .arg(tmp.path())
-            .arg("-o")
-            .arg(out.path())
-            .timeout(OUTER_TIMEOUT)
-            .assert()
-            .failure();
-        let output = String::from_utf8_lossy(&assert.get_output().stdout).into_owned()
-            + &String::from_utf8_lossy(&assert.get_output().stderr);
-        assert!(output.contains("the disk is full"), "{schemata}: {output}");
-        let unviable =
-            read_to_string(out.path().join("mutants.out/unviable.txt")).unwrap_or_default();
-        assert_eq!(unviable, "", "{schemata}");
-    }
+fn a_build_that_runs_out_of_disk_stops_the_run_in_disk_full_build_tree_without_schemata() {
+    assert_disk_full_stops_the_run("--no-schemata");
+}
+
+#[test]
+fn a_build_that_runs_out_of_disk_stops_the_run_in_disk_full_build_tree_with_schemata() {
+    assert_disk_full_stops_the_run("--schemata");
 }
 ```
 
@@ -887,9 +932,13 @@ fn a_build_that_runs_out_of_disk_stops_the_run_in_disk_full_build_tree() {
 cargo nextest run --all-features -E 'test(/ran_out_of_disk_/) | test(/runs_out_of_disk_stops_the_run/)'
 ```
 
-Expected: 3 run. The unit tests fail to compile on `ran_out_of_disk`. Comment them out for a
-moment if you need the integration test's RED on its own. It must fail at `.failure()`, because
-today the run exits 0 with every mutant unviable. Record that output, then restore the unit tests.
+Expected: 5 run. The unit tests fail to compile on `ran_out_of_disk`. Comment them out for a
+moment to see the integration tests' RED on their own, then restore them:
+- `..._without_schemata` fails at `.failure()`: today the run exits 0 with every mutant
+  unviable.
+- `..._with_schemata` fails on `the disk is full`: today it already stops, with
+  `cargo build of the schema failed (Failure(101)) without reporting compile errors`
+  (`src/schemata/run.rs:359-363`). The new check must run before that one.
 
 - [ ] **Step 5: implement** in `src/cargo.rs`:
 
@@ -901,9 +950,11 @@ today the run exits 0 with every mutant unviable. Record that output, then resto
 /// disk image: `docs/work/fallback-build-cost/design.md`, Measured 13.
 ```
 
-INTENT: `pub(crate) fn ran_out_of_disk(text: &str) -> bool`. True if `text` contains
-`No space left on device` or `There is not enough space on the disk`. Name both strings in one
-`const` array with a one-line comment for each platform.
+INTENT: `pub(crate) fn ran_out_of_disk(text: &str) -> bool`. True if a line of `text` contains
+`No space left on device` or `There is not enough space on the disk`. Skip a line that rustc
+quotes from source: one whose text, trimmed of leading space, starts with `|` or with digits
+followed by ` |`. Name both strings in one `const` array with a one-line comment for each
+platform.
 
 In `run_cargo`:
 - Before `Process::run`, record the log file's length, from
@@ -923,16 +974,19 @@ In `Runner::run_step`: after reading `text`, when `phase` is `Check` or `Build`,
 not success, and `ran_out_of_disk(&text)`, `bail!` the same way. Each step has its own log, so the
 whole text is this step's.
 
-- [ ] **Step 6: watch them pass.** Same command. Expected: 3 passed.
+- [ ] **Step 6: watch them pass.** Same command. Expected: 5 passed.
 
 - [ ] **Step 7: commit.**
 
 ```
 cargo fmt && cargo clippy --all-targets --all-features -- -D warnings
+git add testdata/disk_full_build
 git commit -m 'Stop the run when a build fails because the disk is full' -- src/cargo.rs src/schemata/run.rs tests/main.rs testdata/disk_full_build
 ```
 
-- [ ] **Batch B end:** `df -h ~/repos`, then the whole suite. Report counts and each RED line.
+- [ ] **Batch B end:** `df -h ~/repos`, then the whole suite twice: once as your shell is, and
+  once with `CARGO_INCREMENTAL=0` exported, as the fork's CI runs it. Report counts for both and
+  each RED line.
 
 ---
 
@@ -964,7 +1018,8 @@ git commit -m 'Stop the run when a build fails because the disk is full' -- src/
   build dir rebuilds the mutated package once per mutant, and a switch set for a whole shell
   makes each of those builds start from nothing. In `## Seeding build directories from the
   baseline`, add one sentence: the copy leaves out the incremental cache, which the new build
-  dir cannot reuse.
+  dir cannot reuse. In `book/src/schemata.md`, where it lists the keys of `schemata.json`
+  (near `:500-506`), add one sentence naming `removed_env`.
 
 - [ ] **Step 4: the whole gate.** `df -h ~/repos` first.
 
@@ -979,7 +1034,7 @@ Expected: fmt clean, clippy clean, every test passes. Quote the counts.
 - [ ] **Step 5: commit.**
 
 ```
-git commit -m 'Describe incremental scratch builds and the disk-full stop' -- NEWS.md book/src/build-dirs.md Cargo.toml Cargo.lock
+git commit -m 'Describe incremental scratch builds and the disk-full stop' -- NEWS.md book/src/build-dirs.md book/src/schemata.md Cargo.toml Cargo.lock
 ```
 
 ---
@@ -1001,20 +1056,29 @@ git -C ~/repos/om-jastusa/remote-build-platform-v2 worktree add --detach <scratc
 `cargo install`: other sessions run the installed `cargo mutants` and must not see a new
 binary mid-run. Invoke each binary by path, as `<binary> mutants ...`.
 
-- [ ] **Step 2: Postgres and MinIO** for the jast worktree, on ports no other session uses:
+- [ ] **Step 2: Postgres and MinIO** for the jast worktree, on ports no other session uses.
+  Other sessions hold 5432, 9000, 55434 and 59002. First check that the two ports are free:
+  `lsof -i :55436 -i :59006` prints nothing. Then:
 
 ```
 cd <scratch>/jast && JAST_DB_PORT=55436 JAST_MINIO_PORT=59006 COMPOSE_PROJECT_NAME=rbp-fbc just dev-db
 cd <scratch>/jast && JAST_DB_PORT=55436 JAST_MINIO_PORT=59006 COMPOSE_PROJECT_NAME=rbp-fbc just dev-minio
 ```
 
-- [ ] **Step 3: five runs, back to back**, each with that environment and its own `--output`.
+- [ ] **Step 3: five runs, back to back**, each in the jast worktree, with its ports and its own
+  `--output`. Without the ports, the jast tests default to 5432 and 9000 and write into another
+  session's Postgres and MinIO (`apps/backend-core/tests/pg.rs:53`, `tests/s3.rs:55`).
 
 ```
-<binary> mutants -p backend-core --features pg-tests,s3-tests -j2 \
+cd <scratch>/jast && JAST_DB_PORT=55436 JAST_MINIO_PORT=59006 <env> <binary> mutants \
+  -p backend-core --features pg-tests,s3-tests -j2 \
   --file apps/backend-core/src/config.rs --file apps/backend-core/src/adapters/s3_object_store.rs \
   --output <scratch>/out-<run>
 ```
+
+`<env>` is `CARGO_INCREMENTAL=0` or `env -u CARGO_INCREMENTAL`. The old binary is
+`<scratch>/fork-old/target/release/cargo-mutants`. The new one is
+`~/repos/cargo-mutants-wt-fbc/target/release/cargo-mutants`.
 
 | Run | Binary | `CARGO_INCREMENTAL` |
 |---|---|---|
@@ -1052,6 +1116,7 @@ each output directory.
   narrative. Commit it:
 
 ```
+git add docs/work/fallback-build-cost/impl.md
 git commit -m 'Record the fallback-build-cost acceptance runs' -- docs/work/fallback-build-cost/impl.md
 ```
 

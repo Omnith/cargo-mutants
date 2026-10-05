@@ -359,7 +359,9 @@ through unchanged. The coverage collector does the same, and its `set` includes
 `.fingerprint` sibling.** Nothing else about either copy changes.
 
 **One function decides whether a failed phase ran out of disk.** It takes the text the phase
-wrote to its log and returns true when it holds either marker of Measured 13. `run_cargo` and
+wrote to its log and returns true when a line holds either marker of Measured 13. It skips a line
+that rustc quotes from source, because cargo-mutants' own source holds the marker as a literal
+and its CI runs cargo-mutants on itself. `run_cargo` and
 `Runner::run_step` call it only for a failed check or build phase, and return an error that names
 the disk and the log path. The text of a phase is what it appended to the scenario's log, not the
 whole log, so an earlier phase's output cannot match.
