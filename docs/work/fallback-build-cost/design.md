@@ -248,6 +248,26 @@ That is the `strerror` text for `ENOSPC` on macOS and Linux. Windows prints `The
 space on the disk. (os error 112)` for `ERROR_DISK_FULL`. Both reach a classic mutant's log, and
 `outcome.rs:278` reports the mutant `Unviable` because its build failed.
 
+**14. Where the first disk-full check went wrong.** Found by the plan's adversarial review,
+2026-10-05, on a scratch build of this plan's detector, and on a filled 60 MB disk image:
+- **The schemata path quotes source in JSON.** `drop_until_clean` adds `--message-format=json`
+  (`src/schemata/run.rs:322`), so each diagnostic is one line beginning `{"reason":...`, and its
+  `rendered` and `spans[].text` fields quote the source line. A crate holding
+  `let expected = "No space left on device";` gave an ordinary warning, and the schema build
+  stopped with `Error: the disk is full: cargo build failed`. `--no-schemata` on the same crate
+  gave `4 mutants tested: 2 caught, 2 unviable`.
+- **rustc's suggestion gutter quotes source too:** `4 -     report("No space left on device");`.
+- **The macOS linker words it differently.** Linking a 4 MB binary onto the full image gave
+  `error: linking with \`cc\` failed: exit status: 1` and
+  `= note: ld: ftruncate() failed, errno=28 for '<mnt>/big'`. Neither marker of Measured 13
+  appears.
+- **With `-jN` the other workers drain the queue.** `join_threads` (`src/lab.rs:240`) waits for
+  every worker, and `run_queue` takes the next mutant regardless. With `-j2` and one mutant that
+  hit the marker, the error printed at once. The run then tested the 24 other mutants for 92 s
+  on one worker and exited 1.
+- **Removing `CARGO_INCREMENTAL=1` turns incremental off** when the profile says
+  `incremental = false`: `cargo build -v` gave one `incremental=` line with it and none without.
+
 Re-derive Measured 1 and 2: read the named key from `mutants.out/schemata.json`, or sum
 `phase_results[].duration` by phase in `outcomes.json` for the mutants named in
 `fallback_mutants`. Re-derive Measured 6, 7 and 9: the probe scripts mutate one line, time the
@@ -274,9 +294,12 @@ With `--in-place` the build directory is the user's own tree, so their environme
 follows the existing rule for `CARGO_TARGET_DIR`, which `build_dir_cargo_env` overrides in
 scratch directories and keeps in place.
 
-**Removing, not setting.** Setting `CARGO_INCREMENTAL=1` would override a profile's
-`incremental = false` without saying so. Removing the global switches leaves the config and the
-profile in charge.
+**Removing, not setting, and only a value that turns incremental off.** Setting
+`CARGO_INCREMENTAL=1` would override a profile's `incremental = false` without saying so.
+Removing the global switches leaves the config and the profile in charge. A switch that turns
+incremental *on* stays: removing it would turn incremental off for a profile that says
+`incremental = false` (Measured 14). Cargo reads `CARGO_INCREMENTAL` as on only when it is `1`,
+and `CARGO_BUILD_INCREMENTAL` as on only when it is `true`. Any other value of either is removed.
 
 **The cost is disk, and it lands on runs that turned incremental off to save disk.** A
 `backend-core` run with `-j2` peaks at about 3.4 GB more (Measured 8). A classic `-jN` run adds
@@ -309,11 +332,26 @@ it by the same rule.
 makes the mutant `Unviable` (`src/outcome.rs:278`), so a full disk can hide a missed mutant while
 a gate that counts misses still passes. This item adds disk use (Measured 8), so it makes that
 more likely, and the fix is small. When a check or build phase fails and the output that phase
-wrote holds `No space left on device` or `There is not enough space on the disk`, the phase
-returns an error instead of a result (Measured 13). The run then stops the way any internal error
-stops it: the mutant is reverted, `main` returns the error, and the process exits non-zero. The
-message names the full disk and the phase's log. A gate that checks its population against the
-outcomes then fails on the partial run as well.
+reports the disk full, the phase returns an error instead of a result (Measured 13 and 14).
+The run then stops the way any internal error stops it: the mutant is reverted, `main` returns
+the error, and the process exits non-zero. The message names the full disk and the phase's log.
+A gate that checks its population against the outcomes then fails on the partial run as well.
+
+**What counts as the disk reporting full.** The text of a source line can hold the same words,
+so the check reads only what the toolchain says, never what it quotes:
+- A cargo JSON compiler message counts only through its `message` and its children's `message`
+  fields. Its `rendered` text and its spans quote source.
+- Another JSON line, such as an artifact notice, never counts.
+- A plain line counts unless rustc is quoting source on it: a line that, trimmed of leading
+  space, starts with `|`, or with digits followed by ` |`, ` -`, ` +` or ` ~`.
+- The markers are `No space left on device` and `(os error 28)` (macOS and Linux, `ENOSPC`),
+  `There is not enough space on the disk` and `(os error 112)` (Windows, `ERROR_DISK_FULL`, whose
+  text is localized but whose code is not), and `errno=28` on a line that holds `ld:` (the macOS
+  linker).
+
+**One worker's disk-full error stops the others.** A worker that gets the error empties the
+shared queue before it returns, so every other worker finishes the mutant it holds and takes no
+other. Without this, the run tests every remaining mutant first and fails anyway (Measured 14).
 
 The check covers the classic lab's check and build phases (`run_cargo`) and the schemata runner's
 check and build steps (`Runner::run_step` with `Phase::Check` or `Phase::Build`). This section said
@@ -348,9 +386,10 @@ pub struct Env {
 **`Process::start` applies `remove` first, then `set`.** An explicit `set` therefore always wins.
 `remove` exists for inherited values only.
 
-**`build_dir_cargo_env` returns an `Env`.** `remove` holds `CARGO_INCREMENTAL` and
-`CARGO_BUILD_INCREMENTAL` when the build dir is not in place, and is empty in place. It holds the
-names whether or not the variables are set, so the contract does not depend on the caller's
+**`build_dir_cargo_env` returns an `Env`.** `remove` holds each of `CARGO_INCREMENTAL` and
+`CARGO_BUILD_INCREMENTAL` whose inherited value turns incremental off, when the build dir is not
+in place. It is empty in place. The decision reads the environment through a function argument,
+as `EnvSettings::parse` does in `src/schemata/mod.rs`, so tests do not change the process
 environment. The schemata runner's `cargo_env` adds its variables to `set` and passes `remove`
 through unchanged. The coverage collector does the same, and its `set` includes
 `CARGO_INCREMENTAL=0`.
@@ -359,9 +398,13 @@ through unchanged. The coverage collector does the same, and its `set` includes
 `.fingerprint` sibling.** Nothing else about either copy changes.
 
 **One function decides whether a failed phase ran out of disk.** It takes the text the phase
-wrote to its log and returns true when a line holds either marker of Measured 13. It skips a line
-that rustc quotes from source, because cargo-mutants' own source holds the marker as a literal
-and its CI runs cargo-mutants on itself. `run_cargo` and
+wrote to its log and applies the rule in Approach line by line. It reads JSON compiler messages
+through the existing `serde_json` parsing style of `src/schemata/diagnostics.rs`. cargo-mutants'
+own source holds the markers as literals, and its CI runs cargo-mutants on itself, so the quoted
+source rule is not optional.
+
+**`Worker::run_queue` empties the queue on an error** from `run_one_scenario`, under the queue's
+lock, then returns the error. `run_cargo` and
 `Runner::run_step` call it only for a failed check or build phase, and return an error that names
 the disk and the log path. The text of a phase is what it appended to the scenario's log, not the
 whole log, so an earlier phase's output cannot match.
@@ -373,8 +416,9 @@ runs for every spawned process, including every replayed test command. Its exist
 two sites.
 - At the start of a run that uses scratch build directories, one debug event names each
   overridden or removed variable that was set, with its inherited value.
-- When `CARGO_INCREMENTAL` or `CARGO_BUILD_INCREMENTAL` was set and is removed, one console line
-  at info level says so and names the opt-outs.
+- When `CARGO_INCREMENTAL` or `CARGO_BUILD_INCREMENTAL` is removed, one console line at info
+  level names it with its value, says that cargo config and the profile now decide, and names
+  the opt-outs. It does not say the builds are incremental: a profile can still turn that off.
 - `schemata.json` gets `removed_env`, a map from each removed variable that was set to its
   inherited value, for example `{"CARGO_INCREMENTAL": "0"}`. It is empty when nothing was set or
   the run is in place. Measured 5 needed a grep through mutant logs to find the cause. This key
@@ -405,13 +449,20 @@ three reports and the disk-full stop.
    variables with their values. A third test runs with
    `CARGO_PROFILE_<NAME>_INCREMENTAL=false` as well and asserts no `-C incremental=`. Watch each
    fail on the current code before the change.
-4. **A full disk stops the run.** Unit tests of the detector: each marker of Measured 13 matches,
-   a compile error that does not mention the disk does not, and an empty text does not. One
-   integration test on a testdata tree whose build script prints `No space left on device` and
-   fails when the library's source differs from the original. Run with `--no-schemata` and with
-   `--schemata`. cargo-mutants exits non-zero, its output names the disk, and `outcomes.json`
-   records no `Unviable` mutant. Watch it fail on the current code, where the mutants come out
-   `Unviable`.
+4. **A full disk stops the run, and nothing else does.**
+   - Unit tests of the detector. Each marker of Measured 13 and 14 matches, including the macOS
+     linker's note and a JSON compiler message whose own `message` is rustc's ENOSPC text. A
+     compile error that does not mention the disk does not match, nor does empty text. Neither
+     does a quoted source line in each form: a `NN |` line, a `NN -` suggestion line, and a
+     JSON compiler message that holds the marker only in its `rendered` text and spans.
+   - Integration tests on a testdata tree with several functions. Its build script prints
+     `No space left on device` and fails only when one mutation is present. Run with
+     `--no-schemata -j2 --no-shuffle` and with `--schemata`. cargo-mutants exits non-zero, its
+     output names the disk, and `unviable.txt` is empty. With `-j2`, `outcomes.json` holds far
+     fewer mutants than the tree has, so the second worker stopped.
+   - An integration test on a tree whose source holds `No space left on device` as a string
+     literal, run with `--schemata`, finishes normally.
+   - Watch each fail on the current code first.
 5. **The same mutants get the same outcomes, and the builds are incremental whatever the shell
    exports.** In `jast-platform` on `main`, with `just dev-db` and `just dev-minio` up (the
    `pg-tests,s3-tests` features need Postgres and MinIO), run the invocation of Measured 12 in these
@@ -448,7 +499,7 @@ three reports and the disk-full stop.
 |---|---|---|
 | Row 1: build only the targets of the tests that reach a fallback mutant, widen when they pass | Measured 6 and 7 with incremental on: it saves about 4 to 5 s per caught mutant and costs about 7 s per missed one. It can also report a mutant caught that the classic way reports unviable, when the mutant breaks only a target outside the narrow set | a re-measured run after this item where caught fallback builds still take a large share of `fallback_wall_seconds` |
 | Row 2: handle `const`-context mutants differently, for example by checking them before building | Measured 6: with incremental on, an unviable `const` mutant fails in about 3.6 s. A viable one costs the same as any other fallback build | the same re-measure, with `const_context` still the largest reason in `fallback_time_by_reason` |
-| A test phase that fails because the disk is full is reported `CaughtMutant` | A test's own output can carry the same text, so matching it there would misreport real catches. The build phases cover the disk this item adds | a caught mutant whose log shows a disk-full error from the test harness itself |
+| A test phase that fails because the disk is full is reported `CaughtMutant` | A test's own output can carry the same text, so matching it there would misreport real catches. The build phases cover most of the disk this item adds. This item raises the odds of the test-phase case too, because the disk is fuller during the run | a caught mutant whose log shows a disk-full error from the test harness itself |
 | An incremental-only compiler error, such as "found unstable fingerprints", is reported `Unviable` | Upstream builds incremental by default, so the risk is not new to cargo-mutants. No case is known | an unviable mutant whose log has `internal compiler error` |
 | `build.build-dir` (or `CARGO_BUILD_BUILD_DIR`) set to an absolute path moves `deps/` and `incremental/` out of each scratch `target/`, so build dirs share intermediate files | True today. The adversarial review demonstrated the layout, not a collision | a user report, or a probe that shows two build dirs colliding |
 | Bumping the fork's rev in `jast-platform` | That repository pins the rev in its `Justfile` (`just _mutants-tool`) | this item merging. It is a one-line change there |

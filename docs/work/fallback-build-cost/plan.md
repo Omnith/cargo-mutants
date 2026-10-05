@@ -78,6 +78,14 @@ cd ~/repos/cargo-mutants-wt-fbc && graft build
 **Batches.** One implementer per batch, dispatched by the orchestrator, which reviews between
 batches.
 
+**Before Task 1, record a baseline of the whole suite** at the worktree's starting commit, once
+with `CARGO_INCREMENTAL` unset and once with `CARGO_INCREMENTAL=0` exported. Record the pass,
+fail and skip counts and the name of every failure. The plan's review saw
+`schemata_fallback_in_schemata_tree_uses_seed_target_and_logs_timing` fail 3 of 4 times under
+`CARGO_INCREMENTAL=0` before any change (`left: 2, right: 1` seeded dirs, at load 7 to 17). A
+later failure that the baseline already shows is not this item's. Say so in the report rather
+than fixing it.
+
 | Batch | Tasks | Ends with |
 |---|---|---|
 | A | 1, 2, 3 | env plumbing, removal, copy rule, their tests green |
@@ -250,16 +258,19 @@ git commit -m 'Let a child process have inherited variables removed' -- src/proc
 `run_test_command` `:669`), `src/schemata/coverage/collect.rs` (`:391-404`, `:501-505`),
 `tests/main.rs`.
 
-- [ ] **Step 1: write the failing unit test** in `src/cargo.rs`'s `mod test`, beside
+- [ ] **Step 1: write the failing unit tests** in `src/cargo.rs`'s `mod test`, beside
   `build_dir_cargo_env_sets_cargo_target_dir_to_own_target_except_in_place`.
 
 ```rust
 #[test]
-fn build_dir_cargo_env_removes_the_incremental_switches_except_in_place() {
-    let tmp = tempfile::tempdir().unwrap();
-    let build_dir = BuildDir::in_place(tmp.path().try_into().unwrap()).unwrap();
+fn incremental_switches_that_turn_incremental_off_are_removed_except_in_place() {
+    let off = |name: &str| match name {
+        "CARGO_INCREMENTAL" => Some("0".to_owned()),
+        "CARGO_BUILD_INCREMENTAL" => Some("false".to_owned()),
+        _ => None,
+    };
     assert_eq!(
-        build_dir_cargo_env(&build_dir, &Options::default()).remove,
+        incremental_switches_to_remove(&Options::default(), off),
         ["CARGO_INCREMENTAL", "CARGO_BUILD_INCREMENTAL"]
     );
     let in_place = Options {
@@ -267,7 +278,26 @@ fn build_dir_cargo_env_removes_the_incremental_switches_except_in_place() {
         ..Options::default()
     };
     assert_eq!(
-        build_dir_cargo_env(&build_dir, &in_place).remove,
+        incremental_switches_to_remove(&in_place, off),
+        Vec::<String>::new()
+    );
+}
+
+/// A switch that turns incremental on stays: removing it would turn incremental off for a
+/// profile that says `incremental = false`.
+#[test]
+fn incremental_switches_that_turn_incremental_on_or_are_unset_are_kept() {
+    let on = |name: &str| match name {
+        "CARGO_INCREMENTAL" => Some("1".to_owned()),
+        "CARGO_BUILD_INCREMENTAL" => Some("true".to_owned()),
+        _ => None,
+    };
+    assert_eq!(
+        incremental_switches_to_remove(&Options::default(), on),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        incremental_switches_to_remove(&Options::default(), |_| None),
         Vec::<String>::new()
     );
 }
@@ -437,11 +467,12 @@ fn coverage_build_is_not_incremental_in_test_selection_coverage_tree() {
 - [ ] **Step 3: watch them fail.**
 
 ```
-cargo nextest run --all-features -E 'test(/build_dir_cargo_env_removes_the_incremental_switches/) | test(/incremental_switches_from_environment/) | test(/incremental_off_in_the_profile/) | test(/coverage_build_is_not_incremental/)'
+cargo nextest run --all-features -E 'test(/incremental_switches_that_turn/) | test(/incremental_switches_from_environment/) | test(/incremental_off_in_the_profile/) | test(/coverage_build_is_not_incremental/)'
 ```
 
-Expected: 5 run.
-- The unit test fails to compile on the missing `.remove`. Record the error.
+Expected: 6 run.
+- The unit tests fail to compile on the missing `incremental_switches_to_remove`. Record the
+  error.
 - `incremental_switches_..._build_dirs` and `..._schemata_build` fail on the `-C incremental=`
   assertion.
 - `incremental_off_in_the_profile_...` passes today, because nothing is removed yet. It is the
@@ -456,14 +487,25 @@ Expected: 5 run.
 In `src/cargo.rs`, beside `build_dir_cargo_env`:
 
 ```rust
-/// Variables that turn incremental compilation off for every cargo command. A scratch
-/// build dir removes them, so that cargo config and the profile decide.
+/// Variables that switch incremental compilation for every cargo command, each with the
+/// one value that turns it on. Cargo reads `CARGO_INCREMENTAL` first, then
+/// `build.incremental`, whose environment form is `CARGO_BUILD_INCREMENTAL`, then the
+/// profile. Measured in `docs/work/fallback-build-cost/design.md`, Measured 10.
+const INCREMENTAL_SWITCHES: [(&str, &str); 2] =
+    [("CARGO_INCREMENTAL", "1"), ("CARGO_BUILD_INCREMENTAL", "true")];
+
+/// The incremental switches in `var` that a scratch build dir removes: those set to
+/// anything that turns incremental off. None in place.
 ///
-/// Cargo reads `CARGO_INCREMENTAL` first, then `build.incremental`, whose environment form
-/// is `CARGO_BUILD_INCREMENTAL`, then the profile. Measured in
-/// `docs/work/fallback-build-cost/design.md`, Measured 10.
-const REMOVED_IN_BUILD_DIRS: [&str; 2] = ["CARGO_INCREMENTAL", "CARGO_BUILD_INCREMENTAL"];
+/// A switch that turns incremental on stays, because removing it would turn incremental
+/// off for a profile that says `incremental = false` (Measured 14).
+///
+/// `var` reads one variable, so that tests don't change the process environment.
 ```
+
+INTENT: `pub(crate) fn incremental_switches_to_remove(options: &Options, var: impl Fn(&str) ->
+Option<String>) -> Vec<String>`. Empty in place. Otherwise each switch name whose `var` value is
+`Some` and not its on value, in `INCREMENTAL_SWITCHES` order.
 
 Replace `build_dir_cargo_env`'s doc comment with:
 
@@ -476,16 +518,16 @@ Replace `build_dir_cargo_env`'s doc comment with:
 /// concurrent jobs would build into it at once and test each other's mutants.
 /// `CARGO_TARGET_DIR` takes precedence over both.
 ///
-/// `remove` holds [`REMOVED_IN_BUILD_DIRS`], unless mutants are tested in place. A scratch
-/// build dir rebuilds the mutated package once per mutant, so a switch that a shell or a
-/// CI job sets to save disk would make every one of those builds start from nothing.
+/// `remove` holds the switches [`incremental_switches_to_remove`] names. A scratch build
+/// dir rebuilds the mutated package once per mutant, so a switch that a shell or a CI job
+/// sets to save disk would make every one of those builds start from nothing.
 ///
 /// In place, there's only one build dir, which is the user's own tree, so their settings
 /// are kept.
 ```
 
-INTENT: return `Env`. `set` is today's vector. `remove` is `REMOVED_IN_BUILD_DIRS` as owned
-strings when `!options.in_place`, else empty. Delete the per-call `Overriding ...` debug event
+INTENT: return `Env`. `set` is today's vector. `remove` is
+`incremental_switches_to_remove(options, |name| env::var(name).ok())`. Delete the per-call `Overriding ...` debug event
 loop at `:112-119`. Task 4 reports it once per run.
 
 `run_cargo` passes `&build_dir_cargo_env(...)` directly.
@@ -504,7 +546,7 @@ and with `("CARGO_INCREMENTAL", "0")`. Add one comment line above it:
 
 `:501`: extend `env.set` as today.
 
-- [ ] **Step 5: watch them pass.** Same command as Step 3. Expected: 5 passed, or 4 and one
+- [ ] **Step 5: watch them pass.** Same command as Step 3. Expected: 6 passed, or 5 and one
   `SKIPPED` only if llvm-tools cannot be installed. Report that case.
 
 - [ ] **Step 6: commit.**
@@ -722,7 +764,7 @@ cargo nextest run --all-features -E 'test(/env_overrides_/) | test(/incremental_
 Expected: 3 run. The unit tests fail to compile on `env_overrides`. The integration test fails on
 `removed_env` being `null`.
 
-- [ ] **Step 5: implement** in `src/cargo.rs`, beside `REMOVED_IN_BUILD_DIRS`:
+- [ ] **Step 5: implement** in `src/cargo.rs`, beside `INCREMENTAL_SWITCHES`:
 
 ```rust
 /// Variables that a scratch build dir overrides with its own value.
@@ -744,8 +786,10 @@ pub(crate) struct EnvOverrides {
 ```
 
 INTENT: `pub(crate) fn env_overrides(options: &Options, var: impl Fn(&str) -> Option<String>) ->
-EnvOverrides`. In place, return the default. Otherwise look up each name in the two consts and
-keep those `var` returns.
+EnvOverrides`. In place, return the default. `overridden` holds each name in
+`OVERRIDDEN_IN_BUILD_DIRS` that `var` returns. `removed` holds each name that
+`incremental_switches_to_remove` returns, with its value, so the report and the removal never
+disagree.
 
 Then, beside it:
 
@@ -759,8 +803,9 @@ Then, beside it:
 INTENT: `pub(crate) fn report_env_overrides(overrides: &EnvOverrides)`. One
 `debug!(overridden = ?overrides.overridden, removed = ?overrides.removed,
 "build_dirs.env_overrides")` when either map is non-empty. When `removed` is non-empty, one
-`info!` line naming each removed variable as `NAME=value`. It says that scratch build dirs build
-incrementally without it, and lists the opt-outs: `incremental = false` in the profile,
+`info!` line naming each removed variable as `NAME=value`. It says that in scratch build dirs
+cargo config and the profile now decide incremental compilation. It does not say the builds are
+incremental, because a profile can still turn that off. It lists the opt-outs: `incremental = false` in the profile,
 `CARGO_PROFILE_<NAME>_INCREMENTAL=false`, or `build.incremental = false` in cargo config. Read
 the console's other `info!` lines for tone.
 
@@ -792,8 +837,9 @@ git commit -m 'Report the build dirs environment overrides once per run' -- src/
 ## Task 5: a full disk stops the run (Batch B)
 
 **Files:** modify `src/cargo.rs` (`run_cargo`, new `ran_out_of_disk`), `src/schemata/run.rs`
-(`run_step`), `tests/main.rs`. Create `testdata/disk_full_build/Cargo_test.toml`,
-`testdata/disk_full_build/build.rs`, `testdata/disk_full_build/src/lib.rs`.
+(`run_step`), `src/lab.rs` (`Worker::run_queue`), `tests/main.rs`. Create
+`testdata/disk_full_build/{Cargo_test.toml,build.rs,src/lib.rs}` and
+`testdata/disk_full_literal/{Cargo_test.toml,src/lib.rs}`.
 
 - [ ] **Step 1: write the failing unit tests** in `src/cargo.rs`'s `mod test`. The messages are
   the ones Measured 13 captured, plus Windows' `ERROR_DISK_FULL` text.
@@ -831,10 +877,60 @@ fn ran_out_of_disk_does_not_match_a_quoted_source_line() {
         30 |     "No space left on device",
            |     ^^^^^^^^^^^^^^^^^^^^^^^^^ expected `u8`, found `&str`
     "#}));
+    assert!(!ran_out_of_disk(indoc! {r#"
+        help: remove the extra argument
+           |
+        4  -     report("No space left on device");
+        4  +     report();
+    "#}));
+}
+
+/// The macOS linker reports a full disk by its error number only.
+#[test]
+fn ran_out_of_disk_matches_the_macos_linker() {
+    assert!(ran_out_of_disk(indoc! {"
+        error: linking with `cc` failed: exit status: 1
+          = note: ld: ftruncate() failed, errno=28 for '/t/deps/x-1234'
+    "}));
+}
+
+/// With `--message-format=json`, which the schema's check and build use, a diagnostic is one
+/// line. Its own message counts. Its rendered text and spans quote source, so they don't.
+#[test]
+fn ran_out_of_disk_reads_only_the_messages_of_a_json_compiler_message() {
+    let full = json!({
+        "reason": "compiler-message",
+        "message": {
+            "level": "error",
+            "message": "could not write output to /t/deps/x.rcgu.o: No space left on device",
+            "children": [],
+            "spans": [],
+            "rendered": "error: could not write output to /t/deps/x.rcgu.o: No space left on device\n",
+        },
+    });
+    assert!(ran_out_of_disk(&full.to_string()));
+    let quoted = json!({
+        "reason": "compiler-message",
+        "message": {
+            "level": "warning",
+            "message": "unused variable: `expected`",
+            "children": [{
+                "level": "help",
+                "message": "if this is intentional, prefix it with an underscore: `_expected`",
+                "children": [],
+                "spans": [],
+                "rendered": null,
+            }],
+            "spans": [{"text": [{"text": "    let expected = \"No space left on device\";"}]}],
+            "rendered": "warning: unused variable: `expected`\n --> src/lib.rs:4:9\n  |\n4 |     let expected = \"No space left on device\";\n",
+        },
+    });
+    assert!(!ran_out_of_disk(&quoted.to_string()));
 }
 ```
 
-Add `use indoc::indoc;` to the test module if it is not there. `indoc` is already a dependency.
+Add `use indoc::indoc;` and `use serde_json::json;` to the test module if they are not there.
+Both crates are already dependencies.
 
 - [ ] **Step 2: create the testdata tree.**
 
@@ -843,7 +939,7 @@ Add `use indoc::indoc;` to the test module if it is not there. `indoc` is alread
 ```toml
 [package]
 name = "cargo-mutants-testdata-disk-full-build"
-description = "A build script that fails as a full disk would whenever src/lib.rs is mutated"
+description = "A build script that fails as a full disk would when one mutant is applied"
 version = "0.0.0"
 edition = "2021"
 publish = false
@@ -855,21 +951,19 @@ doctest = false
 `testdata/disk_full_build/build.rs`:
 
 ```rust
-//! Fail the build with a full disk's message whenever `src/lib.rs` is mutated.
+//! Fail the build with a full disk's message when one mutant, `x * 2` to `x + 2` in
+//! `double`, is applied, or when the schema holds it. Every other mutant builds, so a
+//! run with two jobs shows whether the second worker stops.
 //!
-//! The unmutated tree builds, so the baseline passes. Every mutant of `double`, and the
-//! schema, changes the line this looks for.
+//! No other line of `src/lib.rs` mutates into `x + 2`.
 
 use std::fs::read_to_string;
 use std::process::exit;
 
 fn main() {
     println!("cargo:rerun-if-changed=src/lib.rs");
-    // A Windows checkout can have CRLF line endings.
-    let source = read_to_string("src/lib.rs")
-        .expect("read src/lib.rs")
-        .replace("\r\n", "\n");
-    if !source.contains("\n    x * 2\n") {
+    let source = read_to_string("src/lib.rs").expect("read src/lib.rs");
+    if source.contains("x + 2") {
         eprintln!("error: No space left on device (os error 28)");
         exit(1);
     }
@@ -883,25 +977,107 @@ pub fn double(x: u32) -> u32 {
     x * 2
 }
 
+pub fn triple(x: u32) -> u32 {
+    x * 3
+}
+
+pub fn square(x: u32) -> u32 {
+    x * x
+}
+
+pub fn larger(a: u32, b: u32) -> u32 {
+    if a > b { a } else { b }
+}
+
+pub fn at_most_ten(x: u32) -> u32 {
+    if x > 10 { 10 } else { x }
+}
+
 #[cfg(test)]
 mod test {
+    use super::*;
+
     #[test]
-    fn double_two_is_four() {
-        assert_eq!(super::double(2), 4);
+    fn double_three_is_six() {
+        assert_eq!(double(3), 6);
+    }
+
+    #[test]
+    fn triple_three_is_nine() {
+        assert_eq!(triple(3), 9);
+    }
+
+    #[test]
+    fn square_three_is_nine() {
+        assert_eq!(square(3), 9);
+    }
+
+    #[test]
+    fn larger_picks_either_argument() {
+        assert_eq!(larger(3, 5), 5);
+        assert_eq!(larger(5, 3), 5);
+    }
+
+    #[test]
+    fn at_most_ten_clamps_above_and_keeps_below() {
+        assert_eq!(at_most_ten(12), 10);
+        assert_eq!(at_most_ten(4), 4);
     }
 }
 ```
+
+`testdata/disk_full_literal/Cargo_test.toml`:
+
+```toml
+[package]
+name = "cargo-mutants-testdata-disk-full-literal"
+description = "Source that holds a full disk's message as text, and one unviable mutant"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+doctest = false
+```
+
+`testdata/disk_full_literal/src/lib.rs`:
+
+```rust
+pub fn greeting(name: &str) -> String {
+    // `+` to `-` doesn't compile, so the schema's check fails and quotes source.
+    name.to_owned() + "!"
+}
+
+#[cfg(test)]
+mod test {
+    #[test]
+    fn greeting_adds_an_exclamation_mark() {
+        // Unused, so rustc warns and quotes this line, as a test of disk-full
+        // handling might hold it.
+        let expected = "No space left on device";
+        assert_eq!(super::greeting("hi"), "hi!");
+    }
+}
+```
+
+Before writing the tests, check the tree with `cargo mutants --list -d <copy>` on a copy of
+`disk_full_build`. Only `replace * with + in double` may produce `x + 2`. List the mutants and
+record the count, and the trigger's position in `--no-shuffle` order. The `-j2` test's bound
+`1..=4` assumes the trigger is among the first three. If it is later, set the upper bound to its
+position plus one, and say so in the report.
 
 - [ ] **Step 3: write the failing integration test** in `tests/main.rs`.
 
 ```rust
 /// A build that fails because the disk is full stops the run with an error, rather than
 /// recording the mutant as unviable: a full disk must not hide a missed mutant.
-fn assert_disk_full_stops_the_run(schemata: &str) {
+fn assert_disk_full_stops_the_run(args: &[&str]) -> TempDir {
     let tmp = copy_of_testdata("disk_full_build");
     let out = tempdir().unwrap();
     let assert = run()
-        .args(["mutants", "--no-times", schemata, "-d"])
+        .args(["mutants", "--no-times"])
+        .args(args)
+        .arg("-d")
         .arg(tmp.path())
         .arg("-o")
         .arg(out.path())
@@ -913,16 +1089,44 @@ fn assert_disk_full_stops_the_run(schemata: &str) {
     assert!(output.contains("the disk is full"), "{output}");
     let unviable = read_to_string(out.path().join("mutants.out/unviable.txt")).unwrap_or_default();
     assert_eq!(unviable, "");
+    out
 }
 
+/// With two jobs, the worker that hits a full disk stops the other one too: the run
+/// doesn't test every remaining mutant before it fails.
 #[test]
 fn a_build_that_runs_out_of_disk_stops_the_run_in_disk_full_build_tree_without_schemata() {
-    assert_disk_full_stops_the_run("--no-schemata");
+    let out = assert_disk_full_stops_the_run(&["--no-schemata", "-j2", "--no-shuffle"]);
+    let started = mutant_logs(&out.path().join("mutants.out")).len();
+    assert!(
+        (1..=4).contains(&started),
+        "the second worker stopped after the mutant it held: {started} mutants started"
+    );
 }
 
 #[test]
 fn a_build_that_runs_out_of_disk_stops_the_run_in_disk_full_build_tree_with_schemata() {
-    assert_disk_full_stops_the_run("--schemata");
+    assert_disk_full_stops_the_run(&["--schemata"]);
+}
+
+/// Source that holds a full disk's message as text is quoted in compile errors and
+/// warnings. That's not the disk, so the run goes on.
+#[test]
+fn source_holding_the_disk_full_message_does_not_stop_the_run_in_disk_full_literal_tree() {
+    for schemata in ["--no-schemata", "--schemata"] {
+        let tmp = copy_of_testdata("disk_full_literal");
+        let out = tempdir().unwrap();
+        run()
+            .args(["mutants", "--no-times", schemata, "-d"])
+            .arg(tmp.path())
+            .arg("-o")
+            .arg(out.path())
+            .timeout(OUTER_TIMEOUT)
+            .assert()
+            .success();
+        let unviable = read_to_string(out.path().join("mutants.out/unviable.txt")).unwrap();
+        assert_eq!(unviable.lines().count(), 1, "{schemata}: {unviable}");
+    }
 }
 ```
 
@@ -932,13 +1136,21 @@ fn a_build_that_runs_out_of_disk_stops_the_run_in_disk_full_build_tree_with_sche
 cargo nextest run --all-features -E 'test(/ran_out_of_disk_/) | test(/runs_out_of_disk_stops_the_run/)'
 ```
 
-Expected: 5 run. The unit tests fail to compile on `ran_out_of_disk`. Comment them out for a
+Expected: 8 run. The unit tests fail to compile on `ran_out_of_disk`. Comment them out for a
 moment to see the integration tests' RED on their own, then restore them:
-- `..._without_schemata` fails at `.failure()`: today the run exits 0 with every mutant
-  unviable.
+- `..._without_schemata` fails at `.failure()`: today the run exits 0 and records the trigger
+  mutant unviable.
 - `..._with_schemata` fails on `the disk is full`: today it already stops, with
   `cargo build of the schema failed (Failure(101)) without reporting compile errors`
-  (`src/schemata/run.rs:359-363`). The new check must run before that one.
+  (`src/schemata/run.rs:359-363`), or it records the trigger mutant unviable. The new check
+  must run before that one.
+- `source_holding_..._disk_full_literal_tree` passes today. It is the guard against the false
+  stop in Measured 14, which the plan's review demonstrated on a probe of this detector. Note
+  in the report that it was green before and after.
+
+After the detector exists, the `-j2` half of `..._without_schemata` still fails on the
+started count until `run_queue` empties the queue. Watch that failure before Step 5's queue
+change.
 
 - [ ] **Step 5: implement** in `src/cargo.rs`:
 
@@ -950,11 +1162,28 @@ moment to see the integration tests' RED on their own, then restore them:
 /// disk image: `docs/work/fallback-build-cost/design.md`, Measured 13.
 ```
 
-INTENT: `pub(crate) fn ran_out_of_disk(text: &str) -> bool`. True if a line of `text` contains
-`No space left on device` or `There is not enough space on the disk`. Skip a line that rustc
-quotes from source: one whose text, trimmed of leading space, starts with `|` or with digits
-followed by ` |`. Name both strings in one `const` array with a one-line comment for each
-platform.
+INTENT: `pub(crate) fn ran_out_of_disk(text: &str) -> bool`, true if any line counts. Per line:
+- A line that starts with `{` and parses as JSON: when its `reason` is `compiler-message`, it
+  counts if `message.message` or any `message.children[].message` holds a marker. Never read
+  `rendered` or `spans`. Any other JSON line never counts. Follow the `serde_json::Value` style
+  of `src/schemata/diagnostics.rs`.
+- Any other line counts if it holds a marker and rustc is not quoting source on it. Quoted
+  source, trimmed of leading space, starts with `|`, or is digits, then spaces, then one of `|`,
+  `-`, `+`, `~`, then a space or the end of the line.
+- Markers, one `const` array with a comment per platform: `No space left on device` and
+  `(os error 28)` (macOS and Linux, `ENOSPC`), `There is not enough space on the disk` and
+  `(os error 112)` (Windows, `ERROR_DISK_FULL`, whose text is localized and whose code is not).
+  Separately, `errno=28` counts only on a line that also holds `ld:` (the macOS linker).
+
+In `src/lab.rs` `Worker::run_queue` (`:400`): when `run_one_scenario` returns an error, empty the
+work queue under its lock (replace the iterator with an empty one) before returning the error.
+Every other worker then finishes the mutant it holds and finds the queue empty. Add to the doc
+comment of `run_queue`:
+
+```rust
+    /// On an error, empty the queue first, so that the other workers stop after the
+    /// mutant each holds, rather than testing every remaining mutant before the run fails.
+```
 
 In `run_cargo`:
 - Before `Process::run`, record the log file's length, from
@@ -974,14 +1203,14 @@ In `Runner::run_step`: after reading `text`, when `phase` is `Check` or `Build`,
 not success, and `ran_out_of_disk(&text)`, `bail!` the same way. Each step has its own log, so the
 whole text is this step's.
 
-- [ ] **Step 6: watch them pass.** Same command. Expected: 5 passed.
+- [ ] **Step 6: watch them pass.** Same command. Expected: 8 passed.
 
 - [ ] **Step 7: commit.**
 
 ```
 cargo fmt && cargo clippy --all-targets --all-features -- -D warnings
-git add testdata/disk_full_build
-git commit -m 'Stop the run when a build fails because the disk is full' -- src/cargo.rs src/schemata/run.rs tests/main.rs testdata/disk_full_build
+git add testdata/disk_full_build testdata/disk_full_literal
+git commit -m 'Stop the run when a build fails because the disk is full' -- src/cargo.rs src/schemata/run.rs src/lab.rs tests/main.rs testdata/disk_full_build testdata/disk_full_literal
 ```
 
 - [ ] **Batch B end:** `df -h ~/repos`, then the whole suite twice: once as your shell is, and
@@ -1007,11 +1236,14 @@ git commit -m 'Stop the run when a build fails because the disk is full' -- src/
     incremental cache while the run lasts, about 1.5 GB on that package. To keep it off, set
     `incremental = false` in the profile, `CARGO_PROFILE_<NAME>_INCREMENTAL=false`, or
     `build.incremental = false` in cargo config. CI jobs that set `CARGO_INCREMENTAL=0` to save
-    disk should use one of these. `--in-place` keeps the environment. Seeding a build dir no
+    disk, or for sccache, which does not cache incremental crates, should use one of these. A
+    switch set to turn incremental on is kept. `--in-place` keeps the environment. Seeding a build dir no
     longer copies the incremental cache. The removal is printed once and recorded as
     `removed_env` in `schemata.json`.
   - **Fixed:** a check or build that fails because the disk is full now stops the run with an
-    error. It used to record the mutant as unviable, so a full disk could hide a missed mutant.
+    error, and the other jobs stop after the mutant each holds. It used to record the mutant as
+    unviable, so a full disk could hide a missed mutant. Source that holds the same message as
+    text does not trigger it.
 
 - [ ] **Step 3: `book/src/build-dirs.md`.** Under `## Target directories`, add a section
   `## Incremental compilation` with the same facts as the Changed bullet, and the reason: each
@@ -1049,10 +1281,11 @@ This is design Acceptance criterion 5. It needs Docker, and about 12 GiB free at
 git -C ~/repos/cargo-mutants worktree add <scratch>/fork-old 2f837e8
 cd <scratch>/fork-old && CARGO_TARGET_DIR=<scratch>/fork-old/target cargo build --release
 cd ~/repos/cargo-mutants-wt-fbc && cargo build --release
-git -C ~/repos/om-jastusa/remote-build-platform-v2 worktree add --detach <scratch>/jast origin/main
+git -C ~/repos/om-jastusa/remote-build-platform-v2 worktree add --detach <scratch>/jast aadd3fe8
 ```
 
-`<scratch>` is a directory the orchestrator names in the dispatch. Do not run
+`<scratch>` is a directory the orchestrator names in the dispatch. The jast worktree is pinned to
+`aadd3fe8`, the rev Measured 12 ran, so its counts and its 20 classic fallback mutants hold. Do not run
 `cargo install`: other sessions run the installed `cargo mutants` and must not see a new
 binary mid-run. Invoke each binary by path, as `<binary> mutants ...`.
 
@@ -1088,17 +1321,24 @@ cd <scratch>/jast && JAST_DB_PORT=55436 JAST_MINIO_PORT=59006 <env> <binary> mut
 | B2 | new | `0` |
 | C | new | unset (`env -u CARGO_INCREMENTAL`) |
 
-Record `uptime` after each run.
+Before each run, `df -h ~/repos`. Stop and report if under 10 GiB: a full disk during an old-rev
+run would record mutants unviable without a word. Record `uptime` after each run.
 
 - [ ] **Step 4: check each criterion and record the evidence.**
   - Outcomes identical across all five: one `name<TAB>summary` list per run from `outcomes.json`,
     then `diff`. Expected: no difference. Measured 12 had 337 mutants, 280 caught and 57 unviable.
+    If one differs, rerun that mutant alone with both binaries (`--re '<exact name>'`, same
+    environment). A difference that involves `Unviable` on a fallback mutant blocks: stop and
+    report. A `Timeout` against `CaughtMutant` on an embedded mutant that the rerun resolves is
+    load. Record it and go on.
   - Each run tested at least 20 fallback mutants the classic way.
   - In B1, B2 and C, every classically built fallback mutant's log has `-C incremental=` on the
     `backend_core` rustc line. In A1 and A2, none has.
   - `removed_env` is `{"CARGO_INCREMENTAL": "0"}` in B1 and B2, and `{}` in C.
   - B1 plus B2 `fallback_wall_seconds` is at most 0.75 of A1 plus A2. If it is above 0.75 with
-    every check above passing, rerun one pair before you conclude, and report both.
+    every check above passing, rerun one pair. If the rerun is also above 0.75, stop and report
+    both pairs with their load averages to the orchestrator, which takes it to Kane. Do not
+    change the threshold.
 
 - [ ] **Step 5: tear down** what this task made, and report the free space before and after.
 
@@ -1145,4 +1385,6 @@ focus as a list of paths.
   `~/repos/cargo-mutants-wt-fbc` and its target.
 
 - [ ] **Step 4: follow-up in jast-platform**, a separate change there: bump the fork rev that
-  `just _mutants-tool` pins to the merge commit.
+  `just _mutants-tool` pins to the merge commit. In the same change, consider
+  `env -u CARGO_INCREMENTAL` in the mutation recipes, so that agents' runs do not print the
+  removal line every time. The fork removes the variable either way.
