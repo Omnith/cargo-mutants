@@ -9,8 +9,9 @@ cannot embed, so the fork tests it the classic way, with a build of its own. On
 **The cause is an inherited environment variable, not the fallback design.** The shell that ran
 the gate exported `CARGO_INCREMENTAL=0`, and cargo-mutants passes it to every cargo command in
 its own scratch build directories (Measured 5). Each fallback build then compiled the mutated
-package from nothing. With incremental compilation on, the same build takes half the time, and an
-unviable `const` mutant fails in an eighth of the time (Measured 6).
+package from nothing. With incremental compilation on, the same build takes half the time.
+An unviable `const` mutant fails in 3.6 s. The run's median for one was 28.4 s, with two builds
+sharing the machine (Measured 6).
 
 **This section said the cost came from rebuilding every test target, and that `const` mutants
 needed different handling. Both were wrong as causes.** Every target is rebuilt, but narrowing
@@ -142,88 +143,170 @@ costs 17 s where one all-targets build costs 10.5 s.
 **8. Disk.** The incremental cache of that worktree's `target/mutants/incremental` was 1.4 GB,
 in a `target/` of 3.8 GB. Each scratch build directory holds one while a run is in progress.
 
+**9. A seeded build directory does not reuse a copied incremental cache.** The probe copied the
+warm worktree, including `target/`, to a new path with `cp -c -R`. It gave every workspace `.rs`
+file a newer modification time, as seeding does (`book/src/build-dirs.md`), then mutated
+`config.rs:675` and built with `CARGO_INCREMENTAL` unset:
+
+| Copied `target/mutants/incremental` | First build | Second build, another mutation |
+|---|---|---|
+| kept, 1.5 GB after | 37.7 s, 28 rustc commands | 12.9 s |
+| removed before the build | 31.8 s, 28 rustc commands | 12.1 s |
+
+The copied cache made the first build slower, not faster. Later builds are warm either way.
+
+**10. Cargo's precedence for incremental mode.** Found by the architecture review on cargo 1.97.1,
+on a crate with a `mutants` profile that inherits `test`, counting `incremental=` in `cargo build
+-v`. `CARGO_INCREMENTAL` wins over everything. Next is `build.incremental`, from a config file or
+from `CARGO_BUILD_INCREMENTAL`. The profile's `incremental` comes last:
+
+| Setting | `incremental=` lines |
+|---|---|
+| none | 1 |
+| `CARGO_INCREMENTAL=0` | 0 |
+| `CARGO_BUILD_INCREMENTAL=false` | 0 |
+| `[build] incremental = false` in config | 0 |
+| profile `incremental = false` | 0 |
+| `CARGO_INCREMENTAL=1` with `CARGO_BUILD_INCREMENTAL=false` | 1 |
+| profile `false` with `CARGO_BUILD_INCREMENTAL=true` | 1 |
+
+**11. Every cargo command in a scratch build dir takes its environment from
+`build_dir_cargo_env`.** Verified by the architecture review: the classic lab (`lab.rs:451` →
+`run_cargo`), check and build iterations (`run.rs:326`), the baseline (`run.rs:436`, `:449`),
+`concurrent_baseline` and `probe_jobs` (through `run_tests`), replays (`run.rs:678`), the
+`cargo test` path (`run.rs:1001`), and both coverage sites (`collect.rs:391` and `:501`, which
+start from `Runner::cargo_env`). In the run of Measured 1, `debug.log` holds 6,228
+`Overriding` events, one for each `start process`.
+
 Re-derive Measured 1 and 2: read the named key from `mutants.out/schemata.json`, or sum
 `phase_results[].duration` by phase in `outcomes.json` for the mutants named in
-`fallback_mutants`. Re-derive Measured 6 and 7: the probe scripts mutate one line, time the
+`fallback_mutants`. Re-derive Measured 6, 7 and 9: the probe scripts mutate one line, time the
 cargo command above with each setting, then restore the line.
 
 ## Approach
 
-**A cargo command in a build directory that cargo-mutants owns does not inherit
-`CARGO_INCREMENTAL`.** The profile then decides. A profile that inherits from `test` or `dev`
-has incremental on. A profile that sets `incremental = false` is honoured, because that is a
-decision about the mutation build and the environment variable usually is not.
+**A command that cargo-mutants runs in a build directory it owns does not inherit
+`CARGO_INCREMENTAL` or `CARGO_BUILD_INCREMENTAL`.** Then cargo's config files and the profile
+decide (Measured 10). A profile that inherits from `test` or `dev` has incremental on.
+
+A setting in a config file or in the profile is honoured, because it is a decision about the
+build. An environment variable usually is not: it is set for the whole shell, for a reason
+unrelated to mutation testing. `CARGO_BUILD_INCREMENTAL` is removed with `CARGO_INCREMENTAL` for
+the reason that `build_dir_cargo_env` treats `CARGO_BUILD_TARGET_DIR` with `CARGO_TARGET_DIR`
+(`src/cargo.rs:112`). Either spelling in the environment disables incremental mode.
 
 With `--in-place` the build directory is the user's own tree, so their environment stands. This
-follows the existing rule for `CARGO_TARGET_DIR` in `build_dir_cargo_env`, which overrides the
-user's setting in scratch directories and keeps it in place.
+follows the existing rule for `CARGO_TARGET_DIR`, which `build_dir_cargo_env` overrides in
+scratch directories and keeps in place.
 
 **Removing, not setting.** Setting `CARGO_INCREMENTAL=1` would override a profile's
-`incremental = false` without saying so. Removing the inherited variable leaves the profile in
-charge.
+`incremental = false` without saying so. Removing the inherited variables leaves the config and
+the profile in charge. A user who wants incremental off in scratch builds, for example on a
+disk-bound CI runner, sets `incremental = false` in the mutation profile or `build.incremental =
+false` in cargo config.
 
-**The first fallback build in each build directory is still a full build of the workspace
-packages.** A directory's incremental cache is built from the schema's source, and a seeded
-directory has a different path, so neither matches the restored original source. Later builds
-in that directory are incremental. With `--jobs 2` that is two cold builds per run.
+**The removal covers every command `build_dir_cargo_env` serves** (Measured 11). That includes the
+coverage collector's instrumented build and its test runs. It is one build per run, so it costs
+one incremental cache's disk and gains nothing measured. Leaving it out would need a second
+environment path for one build, and the two would drift.
 
-The change applies to every cargo command that `build_dir_cargo_env` serves: the classic lab's
-check, build and test phases, and the schemata runner's check, build, baseline and test
-commands. Tests that cargo runs also stop seeing an inherited `CARGO_INCREMENTAL`.
+**Seeding a build directory skips the incremental cache.** `copy_target_dir` copies the baseline
+build's `target/` into each extra build directory and into the coverage copy. With incremental
+on, that `target/` holds a cache of about 1.4 GB (Measured 8), and a seeded directory does not
+reuse it (Measured 9). The copy leaves out every directory named `incremental` that sits directly
+in a profile's output directory, `target/<profile>/` or `target/<triple>/<profile>/`.
+
+**The first fallback build in each build directory is a full build of the workspace packages.**
+Measured 9 shows it for a seeded directory. build_dir_0's cache was built from the schema's
+source, which differs from the restored original in most functions. Later builds in a directory
+are incremental. With `--jobs 2` that is two cold builds per run.
+
+Tests that cargo runs also stop seeing an inherited `CARGO_INCREMENTAL` or
+`CARGO_BUILD_INCREMENTAL`.
 
 ## Interfaces / contracts
 
-**`build_dir_cargo_env` returns what to set and what to remove.** A small struct replaces the
-bare `Vec<(String, String)>` at this boundary:
+**`process.rs` owns the environment type.** `Process::run` and `Process::start` take it in place
+of `&[(String, String)]`. `cargo.rs` builds it. `process.rs` sits below `cargo.rs` and must not
+depend on it.
 
 ```rust
-/// Environment changes for a cargo command run in a build dir.
-pub(crate) struct CargoEnv {
+/// Environment changes for a child process, relative to cargo-mutants' own environment.
+pub struct Env {
+    /// Variables inherited from cargo-mutants' environment that the child must not see.
+    pub remove: Vec<String>,
     /// Variables to set.
     pub set: Vec<(String, String)>,
-    /// Variables inherited from cargo-mutants' environment that the command must not see.
-    pub remove: Vec<String>,
 }
 ```
 
-`remove` holds `CARGO_INCREMENTAL` when the build dir is not in place, and is empty in place. It
-holds the name whether or not the variable is set, so the contract does not depend on the
-caller's environment.
+**`Process::start` applies `remove` first, then `set`.** An explicit `set` therefore always wins.
+`remove` exists for inherited values only.
 
-**`Process::run` and `Process::start` apply removals** with `Command::env_remove` after
-`Command::envs`. Their five callers (`cargo.rs` `run_cargo`, `schemata/run.rs` at three sites,
-`schemata/coverage/collect.rs`) pass the removals through. The coverage collector passes none: it
-builds its own environment for an instrumented copy, and this item does not change it.
+**`build_dir_cargo_env` returns an `Env`.** `remove` holds `CARGO_INCREMENTAL` and
+`CARGO_BUILD_INCREMENTAL` when the build dir is not in place, and is empty in place. It holds the
+names whether or not the variables are set, so the contract does not depend on the caller's
+environment. The schemata runner's `cargo_env` and the coverage collector add their variables to
+`set` and pass `remove` through unchanged.
 
-The schemata runner's `cargo_env` adds the mutant id and other variables to the `set` half. It
-passes `remove` through unchanged.
+**`copy_target_dir` skips a profile's `incremental` directory.** The skip applies to seeding and
+to the coverage copy, which both call it. Nothing else about the copy changes.
 
-**One debug event when an inherited value is dropped.** It names the variable and its value, in
-the same shape as the `CARGO_TARGET_DIR` override's event. A slow run is then explained by
-`debug.log`, and the rustc lines in each mutant's log show `-C incremental=`.
+**The removal is reported once per run, never per command.** `build_dir_cargo_env` runs for every
+spawned process, including every replayed test command (Measured 11), so an event there would add
+one line per process.
+- One debug event at the start of the run names each removed variable that was set, with its
+  inherited value. It is emitted only when the run uses scratch build directories.
+- `schemata.json` gets `removed_env`, a map from each removed variable that was set to its
+  inherited value, for example `{"CARGO_INCREMENTAL": "0"}`. It is empty when nothing was set or
+  the run is in place. Measured 5 needed a grep through mutant logs to find the cause. This key
+  replaces that.
 
-The plan defines the type's name, module and visibility. The contract is the two halves, and that
-`remove` is applied after `set`.
+The plan fixes the type's exact name and visibility, and the call site of the once-per-run event.
+The contract is the two halves, the removal order, the two variable names and the two reports.
 
 ## Acceptance criteria
 
-1. **A unit test** beside `build_dir_cargo_env_sets_cargo_target_dir_to_own_target_except_in_place`:
-   `remove` names `CARGO_INCREMENTAL` for a scratch build dir and is empty with `--in-place`.
-2. **An integration test** in `tests/main.rs` runs cargo-mutants on a small testdata tree with
-   `CARGO_INCREMENTAL=0` in its environment. A mutant's log shows a rustc line for the mutated
-   crate that carries `-C incremental=`. Watch it fail on the current code before the change.
-3. **The same mutants get the same outcomes, faster.** In `jast-platform` on `main`, with
-   `CARGO_INCREMENTAL=0` exported, run
+1. **Unit tests in `cargo.rs`**, beside
+   `build_dir_cargo_env_sets_cargo_target_dir_to_own_target_except_in_place`: `remove` names both
+   variables for a scratch build dir and is empty with `--in-place`. **In `process.rs`**: a
+   variable in both `remove` and `set` reaches the child with the `set` value.
+2. **A unit test in `copy_tree.rs`**, beside `copy_target_dir_when_requested`: a
+   `target/debug/incremental/` and a `target/<triple>/debug/incremental/` are not copied. A file
+   beside each is copied.
+3. **Integration tests in `tests/main.rs`, one per path**, following the two tests of the
+   `CARGO_TARGET_DIR` change at `tests/main.rs:5681` (`--no-schemata -j2`) and `:5712`
+   (`--schemata`). Each runs on a small testdata tree with `CARGO_INCREMENTAL=0` and
+   `CARGO_BUILD_INCREMENTAL=false` in the environment. The classic test asserts that a mutant's
+   log has a rustc line for the mutated crate carrying `-C incremental=`. The schemata test
+   asserts the same of a `schemata-build` log, and that `schemata.json` `removed_env` names both
+   variables with their values. Watch each fail on the current code before the change.
+4. **The same mutants get the same outcomes, faster, and the speed does not depend on the
+   shell.** In `jast-platform` on `main`, with `just dev-db` and `just dev-minio` up (the
+   `pg-tests,s3-tests` features need Postgres and MinIO), run
    `cargo mutants -p backend-core --features pg-tests,s3-tests -j2 --file apps/backend-core/src/config.rs --file apps/backend-core/src/adapters/s3_object_store.rs`
-   once with rev `2f837e8` and once with this item's rev. The two files hold 20 of the 47
-   `const_context` mutants in Measured 2.
-   - Every mutant's outcome in `outcomes.json` is identical between the two runs.
-   - `fallback_wall_seconds` in `schemata.json` is at most half of the old rev's.
-   - Every fallback mutant's build log on the new rev shows `-C incremental=`.
-4. `cargo test --all-features` and `cargo clippy --all-targets --all-features -- -D warnings`
+   three times:
+
+   | Run | Rev | Environment |
+   |---|---|---|
+   | A | `2f837e8` | `CARGO_INCREMENTAL=0` exported |
+   | B | this item's | `CARGO_INCREMENTAL=0` exported |
+   | C | this item's | `CARGO_INCREMENTAL` unset |
+
+   - Every mutant's outcome in `outcomes.json` is identical across A, B and C.
+   - The two files hold 20 of the 47 `const_context` mutants in Measured 2. Each run's
+     `schemata.json` names at least 20 classically tested fallback mutants. Fewer means the
+     comparison does not measure this change.
+   - B's `fallback_wall_seconds` is at most half of A's. C's is within 20% of B's.
+   - In B, every classically built fallback mutant's log carries `-C incremental=` on the
+     `backend_core` rustc line. In A, none does.
+   - B's `schemata.json` `removed_env` is `{"CARGO_INCREMENTAL": "0"}`. C's is empty.
+5. `cargo test --all-features` and `cargo clippy --all-targets --all-features -- -D warnings`
    pass in the fork. `cargo fmt` is clean.
-5. `NEWS.md` and `book/src/build-dirs.md` say that a scratch build dir ignores an inherited
-   `CARGO_INCREMENTAL`, why, and that `--in-place` keeps it.
+6. `NEWS.md` and `book/src/build-dirs.md` say that a scratch build dir ignores an inherited
+   `CARGO_INCREMENTAL` and `CARGO_BUILD_INCREMENTAL`, and why. They say that `--in-place`, a
+   config file and the profile are honoured, how to turn incremental mode off, and that seeding
+   skips the incremental cache.
 
 ## Out of scope
 
@@ -231,7 +314,6 @@ The plan defines the type's name, module and visibility. The contract is the two
 |---|---|---|
 | Row 1: build only the targets of the tests that reach a fallback mutant, widen when they pass | Measured 6 and 7 with incremental on: it saves about 4 to 5 s per caught mutant and costs about 7 s per missed one. It can also report a mutant caught that the classic way reports unviable, when the mutant breaks only a target outside the narrow set | a re-measured run after this item where caught fallback builds still take a large share of `fallback_wall_seconds` |
 | Row 2: handle `const`-context mutants differently, for example by checking them before building | Measured 6: with incremental on, an unviable `const` mutant fails in about 3.6 s. A viable one costs the same as any other fallback build | the same re-measure, with `const_context` still the largest reason in `fallback_time_by_reason` |
-| The coverage collector's environment | One build per run, not one per mutant | a measured coverage build that is slow for the same reason |
 | Bumping the fork's rev in `jast-platform` | That repository pins the rev in its `Justfile` (`just _mutants-tool`) | this item merging. It is a one-line change there |
 
 ## Dependencies
