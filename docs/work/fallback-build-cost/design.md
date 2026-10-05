@@ -27,7 +27,8 @@ for a scratch build directory that cargo-mutants creates, rebuilds dozens of tim
 
 A maintainer running the full gate waits for the mutants that need testing, not for repeated
 whole-package rebuilds. The outcome counts are unchanged. The speed does not depend on what the
-maintainer's shell exports.
+maintainer's shell exports. A full disk stops the run with an error. It does not hide a missed mutant as
+an unviable one.
 
 ## Measured
 
@@ -230,6 +231,23 @@ same in all four runs: 280 caught, 57 unviable.
 The single-build probes in Measured 6 overstate the gain under load. The real gain is between
 0.4 and 0.7 of the fallback phase.
 
+**13. What cargo and rustc print when the disk fills.** A 60 MB HFS+ disk image, filled to
+572 KiB free, a one-function crate, `CARGO_TARGET_DIR` on the image, 2026-10-05. Paths shortened
+to `<mnt>`:
+
+```
+$ cargo test --no-run -v          # exit 101
+error: could not write output to <mnt>/t-build/debug/deps/enospc_probe-....rcgu.o: No space left on device
+error: failed to build archive at `<mnt>/t-build/debug/deps/libenospc_probe-....rlib`: couldn't create a directory for the temp file: No space left on device (os error 28) at path "<mnt>/
+$ cargo check --tests -v          # exit 101, once the image was full
+error: No space left on device (os error 28) at path "<mnt>/t-check2Bgxhcw"
+```
+
+rustc's object write, its archive step and cargo itself each print `No space left on device`.
+That is the `strerror` text for `ENOSPC` on macOS and Linux. Windows prints `There is not enough
+space on the disk. (os error 112)` for `ERROR_DISK_FULL`. Both reach a classic mutant's log, and
+`outcome.rs:278` reports the mutant `Unviable` because its build failed.
+
 Re-derive Measured 1 and 2: read the named key from `mutants.out/schemata.json`, or sum
 `phase_results[].duration` by phase in `outcomes.json` for the mutants named in
 `fallback_mutants`. Re-derive Measured 6, 7 and 9: the probe scripts mutate one line, time the
@@ -287,6 +305,21 @@ directory: the adversarial review deleted it and cargo still reported the crate 
 `copy_tree`'s `copy_target` option, which copies the user's own `target/` into build_dir_0, skips
 it by the same rule.
 
+**A check or build that fails because the disk is full ends the run with an error.** Today it
+makes the mutant `Unviable` (`src/outcome.rs:278`), so a full disk can hide a missed mutant while
+a gate that counts misses still passes. This item adds disk use (Measured 8), so it makes that
+more likely, and the fix is small. When a check or build phase fails and the output that phase
+wrote holds `No space left on device` or `There is not enough space on the disk`, the phase
+returns an error instead of a result (Measured 13). The run then stops the way any internal error
+stops it: the mutant is reverted, `main` returns the error, and the process exits non-zero. The
+message names the full disk and the phase's log. A gate that checks its population against the
+outcomes then fails on the partial run as well.
+
+The check covers the classic lab's check and build phases (`run_cargo`) and the schemata runner's
+steps (`Runner::run_step`), which runs the schema's check and build and the coverage build. It
+does not cover the test phase. A test's own output can carry that text, for example a test of
+disk-full handling, and a test that fails is a caught mutant by definition.
+
 **The first fallback build in each build directory is a full build of the workspace packages.**
 Measured 9 shows it for a seeded directory. build_dir_0's cache was built from the schema's
 source, which differs from the restored original in most functions. Later builds in a directory
@@ -323,6 +356,12 @@ through unchanged. The coverage collector does the same, and its `set` includes
 **`copy_target_dir` and `copy_tree`'s `copy_target` skip an `incremental` directory that has a
 `.fingerprint` sibling.** Nothing else about either copy changes.
 
+**One function decides whether a failed phase ran out of disk.** It takes the text the phase
+wrote to its log and returns true when it holds either marker of Measured 13. `run_cargo` and
+`Runner::run_step` call it only for a failed check or build phase, and return an error that names
+the disk and the log path. The text of a phase is what it appended to the scenario's log, not the
+whole log, so an earlier phase's output cannot match.
+
 **Environment overrides are reported once per run, never per command.** `build_dir_cargo_env`
 runs for every spawned process, including every replayed test command. Its existing
 `CARGO_TARGET_DIR` event already writes one line per process: 6,228 in the run of Measured 1
@@ -338,8 +377,8 @@ two sites.
   replaces that.
 
 The plan fixes the type's exact name and visibility, and the call site of the once-per-run report.
-The contract is the two halves, the removal order, the two variable names, the copy rule and the
-three reports.
+The contract is the two halves, the removal order, the two variable names, the copy rule, the
+three reports and the disk-full stop.
 
 ## Acceptance criteria
 
@@ -362,7 +401,14 @@ three reports.
    variables with their values. A third test runs with
    `CARGO_PROFILE_<NAME>_INCREMENTAL=false` as well and asserts no `-C incremental=`. Watch each
    fail on the current code before the change.
-4. **The same mutants get the same outcomes, and the builds are incremental whatever the shell
+4. **A full disk stops the run.** Unit tests of the detector: each marker of Measured 13 matches,
+   a compile error that does not mention the disk does not, and an empty text does not. One
+   integration test on a testdata tree whose build script prints `No space left on device` and
+   fails when the library's source differs from the original. Run with `--no-schemata` and with
+   `--schemata`. cargo-mutants exits non-zero, its output names the disk, and `outcomes.json`
+   records no `Unviable` mutant. Watch it fail on the current code, where the mutants come out
+   `Unviable`.
+5. **The same mutants get the same outcomes, and the builds are incremental whatever the shell
    exports.** In `jast-platform` on `main`, with `just dev-db` and `just dev-minio` up (the
    `pg-tests,s3-tests` features need Postgres and MinIO), run the invocation of Measured 12 in these
    environments:
@@ -384,12 +430,13 @@ three reports.
      summed `fallback_wall_seconds` is at most 0.75 of the A runs' sum. Measured 12 gave 0.57
      under load. A ratio above 0.75 with every deterministic check passing means a removal path
      was missed, or load hid the gain. Rerun the pair before concluding which.
-5. `cargo test --all-features` and `cargo clippy --all-targets --all-features -- -D warnings`
+6. `cargo test --all-features` and `cargo clippy --all-targets --all-features -- -D warnings`
    pass in the fork. `cargo fmt` is clean.
-6. `NEWS.md` and `book/src/build-dirs.md` say that a scratch build dir ignores the two global
+7. `NEWS.md` and `book/src/build-dirs.md` say that a scratch build dir ignores the two global
    switches, and why. They say that `--in-place`, cargo config, the profile and
    `CARGO_PROFILE_<NAME>_INCREMENTAL` are honoured. They state the disk cost and the three
-   opt-outs, with a note for CI users, and that seeding skips the incremental cache.
+   opt-outs, with a note for CI users, and that seeding skips the incremental cache. `NEWS.md`
+   also says that a check or build that runs out of disk now stops the run.
 
 ## Out of scope
 
@@ -397,7 +444,7 @@ three reports.
 |---|---|---|
 | Row 1: build only the targets of the tests that reach a fallback mutant, widen when they pass | Measured 6 and 7 with incremental on: it saves about 4 to 5 s per caught mutant and costs about 7 s per missed one. It can also report a mutant caught that the classic way reports unviable, when the mutant breaks only a target outside the narrow set | a re-measured run after this item where caught fallback builds still take a large share of `fallback_wall_seconds` |
 | Row 2: handle `const`-context mutants differently, for example by checking them before building | Measured 6: with incremental on, an unviable `const` mutant fails in about 3.6 s. A viable one costs the same as any other fallback build | the same re-measure, with `const_context` still the largest reason in `fallback_time_by_reason` |
-| A build that fails because the disk is full is reported `Unviable` (`src/outcome.rs:278`), so a full disk can hide a missed mutant | It is true today. This item makes it more likely by the disk in Measured 8. It is a defect in outcome classification, with its own design: whether the run stops, retries or reports an error | ENOSPC in any unviable mutant's log. Kane decides whether it is pulled into this item |
+| A test phase that fails because the disk is full is reported `CaughtMutant` | A test's own output can carry the same text, so matching it there would misreport real catches. The build phases cover the disk this item adds | a caught mutant whose log shows a disk-full error from the test harness itself |
 | An incremental-only compiler error, such as "found unstable fingerprints", is reported `Unviable` | Upstream builds incremental by default, so the risk is not new to cargo-mutants. No case is known | an unviable mutant whose log has `internal compiler error` |
 | `build.build-dir` (or `CARGO_BUILD_BUILD_DIR`) set to an absolute path moves `deps/` and `incremental/` out of each scratch `target/`, so build dirs share intermediate files | True today. The adversarial review demonstrated the layout, not a collision | a user report, or a probe that shows two build dirs colliding |
 | Bumping the fork's rev in `jast-platform` | That repository pins the rev in its `Justfile` (`just _mutants-tool`) | this item merging. It is a one-line change there |
