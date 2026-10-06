@@ -50,7 +50,7 @@ use crate::cargo::cargo_argv;
 use crate::interrupt::check_interrupted;
 use crate::outcome::Phase;
 use crate::package::PackageSelection;
-use crate::process::{Exit, Process};
+use crate::process::{Env, Exit, Process};
 use crate::schemata::replay::{Quoting, ReplayCommand, test_commands_with_output};
 use crate::schemata::run::Runner;
 use crate::schemata::run::capture_argv;
@@ -511,7 +511,10 @@ fn run_tests(
                         let start = Instant::now();
                         let exit = Process::run(
                             &argv,
-                            &env,
+                            &Env {
+                                set: env,
+                                remove: Vec::new(),
+                            },
                             &command.cwd,
                             Some(timeout),
                             None,

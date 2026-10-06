@@ -47,6 +47,18 @@ mod unix;
 #[cfg(unix)]
 use unix::{configure_command, terminate_child};
 
+/// Environment changes for a child process, relative to cargo-mutants' own environment.
+///
+/// `remove` is applied before `set`, so a variable named in both reaches the child with
+/// its `set` value. `remove` is for values inherited from cargo-mutants' environment.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Env {
+    /// Variables inherited from cargo-mutants' environment that the child must not see.
+    pub remove: Vec<String>,
+    /// Variables to set.
+    pub set: Vec<(String, String)>,
+}
+
 pub struct Process {
     child: Child,
     start: Instant,
@@ -63,7 +75,7 @@ impl Process {
     #[allow(clippy::too_many_arguments)]
     pub fn run(
         argv: &[String],
-        env: &[(String, String)],
+        env: &Env,
         cwd: &Utf8Path,
         timeout: Option<Duration>,
         jobserver: Option<&jobserver::Client>,
@@ -111,7 +123,7 @@ impl Process {
     /// Launch a process, and return an object representing the child.
     pub fn start(
         argv: &[String],
-        env: &[(String, String)],
+        env: &Env,
         cwd: &Utf8Path,
         timeout: Option<Duration>,
         jobserver: Option<&jobserver::Client>,
@@ -121,11 +133,14 @@ impl Process {
         let quoted_argv = quote_argv(argv);
         scenario_output.message(&quoted_argv)?;
         debug!(%quoted_argv, "start process");
-        let os_env = env.iter().map(|(k, v)| (OsStr::new(k), OsStr::new(v)));
         let mut command = Command::new(&argv[0]);
+        command.args(&argv[1..]);
+        // remove first, so that a variable that is also set reaches the child
+        for name in &env.remove {
+            command.env_remove(name);
+        }
         command
-            .args(&argv[1..])
-            .envs(os_env)
+            .envs(env.set.iter().map(|(k, v)| (OsStr::new(k), OsStr::new(v))))
             .stdin(Stdio::null())
             .stdout(scenario_output.open_log_append()?)
             .stderr(scenario_output.open_log_append()?)
@@ -253,5 +268,79 @@ mod test {
             quote_argv(["with whitespace", "\r\n\t\t"]),
             r"with\ whitespace \r\n\t\t"
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod env_test {
+    use std::fs::read_to_string;
+
+    use camino::Utf8Path;
+    use rusty_fork::rusty_fork_test;
+
+    use super::{Env, Process};
+    use crate::console::Console;
+    use crate::output::OutputDir;
+    use crate::test_util::single_threaded_set_env_var;
+
+    const NAME: &str = "CARGO_MUTANTS_TEST_INHERITED";
+
+    /// The value of [`NAME`] that a child process sees, or `unset`.
+    fn child_sees(env: &Env) -> String {
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp_path = Utf8Path::from_path(tmp.path()).unwrap();
+        let mut output_dir = OutputDir::new(tmp_path).unwrap();
+        let mut log = output_dir.start_log("env").unwrap();
+        let argv = [
+            "sh",
+            "-c",
+            "echo \"seen=${CARGO_MUTANTS_TEST_INHERITED-unset}\"",
+        ]
+        .map(str::to_owned);
+        let exit = Process::run(
+            &argv,
+            env,
+            tmp_path,
+            None,
+            None,
+            &mut log,
+            &Console::new(),
+            None,
+        )
+        .unwrap();
+        assert!(exit.is_success(), "{exit:?}");
+        let text = read_to_string(output_dir.path().join(log.log_path())).unwrap();
+        text.lines()
+            .find_map(|line| line.strip_prefix("seen="))
+            .expect("the child printed what it saw")
+            .to_owned()
+    }
+
+    rusty_fork_test! {
+        #[test]
+        fn child_inherits_a_variable_that_remove_does_not_name() {
+            single_threaded_set_env_var(NAME, "inherited");
+            assert_eq!(child_sees(&Env::default()), "inherited");
+        }
+
+        #[test]
+        fn child_does_not_see_a_variable_that_remove_names() {
+            single_threaded_set_env_var(NAME, "inherited");
+            let env = Env {
+                remove: vec![NAME.to_owned()],
+                set: Vec::new(),
+            };
+            assert_eq!(child_sees(&env), "unset");
+        }
+
+        #[test]
+        fn child_sees_the_set_value_of_a_variable_that_is_removed_and_set() {
+            single_threaded_set_env_var(NAME, "inherited");
+            let env = Env {
+                remove: vec![NAME.to_owned()],
+                set: vec![(NAME.to_owned(), "set".to_owned())],
+            };
+            assert_eq!(child_sees(&env), "set");
+        }
     }
 }

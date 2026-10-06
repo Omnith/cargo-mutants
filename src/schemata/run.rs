@@ -33,7 +33,7 @@ use crate::options::Options;
 use crate::outcome::{Phase, PhaseResult, ScenarioOutcome, SummaryOutcome};
 use crate::output::{OutputDir, ScenarioOutput};
 use crate::package::PackageSelection;
-use crate::process::{Exit, Process, TERMINATES_DESCENDANTS};
+use crate::process::{Env, Exit, Process, TERMINATES_DESCENDANTS};
 use crate::scenario::Scenario;
 use crate::timeouts::Timeouts;
 use crate::{Mutant, Result};
@@ -271,9 +271,13 @@ impl Runner<'_> {
             .expect("lock output dir")
             .start_log(log_name)?;
         let start = Instant::now();
+        let env = Env {
+            set: env.to_vec(),
+            remove: Vec::new(),
+        };
         let process_status = Process::run(
             &argv,
-            env,
+            &env,
             self.build_dir.path(),
             timeout,
             self.jobserver,
@@ -678,6 +682,10 @@ impl Runner<'_> {
         let mut env = self.cargo_env();
         env.extend(command.env.iter().cloned());
         env.push((ID_ENV_VAR.to_owned(), id.to_string()));
+        let env = Env {
+            set: env,
+            remove: Vec::new(),
+        };
         let status = Process::run(
             argv,
             &env,
@@ -998,7 +1006,10 @@ impl Runner<'_> {
             let argv = cargo_argv(selection, Phase::Test, self.options);
             let status = Process::run(
                 &argv,
-                &self.test_env(id),
+                &Env {
+                    set: self.test_env(id),
+                    remove: Vec::new(),
+                },
                 self.build_dir.path(),
                 timeout,
                 self.jobserver,

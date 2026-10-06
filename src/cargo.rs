@@ -21,7 +21,7 @@ use crate::options::{Options, TestTool};
 use crate::outcome::{Phase, PhaseResult};
 use crate::output::ScenarioOutput;
 use crate::package::PackageSelection;
-use crate::process::{Exit, Process, TERMINATES_DESCENDANTS};
+use crate::process::{Env, Exit, Process, TERMINATES_DESCENDANTS};
 
 // Allowed nextest codes (those will be considered a mutation caught / ignored without a warning)
 const NEXTEST_ALLOWED_CODES: &[i32] = &[
@@ -48,7 +48,10 @@ pub fn run_cargo(
     let _span = debug_span!("run", ?phase).entered();
     let start = Instant::now();
     let argv = cargo_argv(packages, phase, options);
-    let env = build_dir_cargo_env(build_dir, options);
+    let env = Env {
+        set: build_dir_cargo_env(build_dir, options),
+        remove: Vec::new(),
+    };
     let process_status = Process::run(
         &argv,
         &env,
