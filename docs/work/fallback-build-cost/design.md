@@ -503,9 +503,9 @@ three reports and the disk-full stop.
    - Unit tests of the detector. Each marker of Measured 13 and 14 matches on its own, on the
      platform that has it. So do the macOS linker's note, as a plain line and in a JSON child
      `message`, and a JSON compiler message whose own `message` is rustc's ENOSPC text. Another
-     platform's error code does not match. A linker failure without `errno=28` does not match. A
+     platform's error code does not match. A linker failure without `errno=28` does not match, nor does `errno=28` without `ld:`. A
      compile error that does not mention the disk does not match, nor does empty text. Neither
-     does a quoted source line in each form: a `NN |` line, a `NN -` suggestion line, a colored
+     does a quoted source line in each form: a `NN |` line, a `NN -`, `NN +` and `NN ~` suggestion line, a colored
      `NN |` line, a build script's warning that forwards a gutter line, and a JSON compiler message
      that holds the marker only in its `rendered` text and spans. A build script's warning that
      forwards the error itself does match.

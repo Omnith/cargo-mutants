@@ -702,15 +702,13 @@ mod test {
         "#}),
             None
         );
-        assert_eq!(
-            ran_out_of_disk(indoc! {r#"
-            help: remove the extra argument
-               |
-            4  -     report("No space left on device");
-            4  +     report();
-        "#}),
-            None
-        );
+        // a suggestion's removed, added and changed lines
+        for symbol in ['-', '+', '~'] {
+            let suggestion = format!(
+                "help: consider this\n   |\n4  {symbol}     report(\"No space left on device\");\n"
+            );
+            assert_eq!(ran_out_of_disk(&suggestion), None, "{symbol}");
+        }
     }
 
     /// cargo prints a build script's warning as `warning: <package>@<version>: <text>`, and
@@ -783,6 +781,8 @@ mod test {
         "}),
             None
         );
+        // the error number alone is not the linker's
+        assert_eq!(ran_out_of_disk("error: write failed, errno=28\n"), None);
     }
 
     /// With `--message-format=json`, rustc puts the linker's output in a child message.
