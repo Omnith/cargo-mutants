@@ -75,16 +75,21 @@ pub fn run_cargo(
     )?;
     check_interrupted()?;
     debug!(?process_status, elapsed = ?start.elapsed());
-    if matches!(phase, Phase::Check | Phase::Build) && !process_status.is_success() {
-        let mut log = scenario_output.open_log_read()?;
-        log.seek(SeekFrom::Start(log_start))
-            .context("seek to this phase's output in the log")?;
-        let mut text = Vec::new();
-        log.read_to_end(&mut text)
-            .context("read this phase's output from the log")?;
-        let log_path = scenario_output.output_dir.join(scenario_output.log_path());
-        stop_if_disk_full(phase, &String::from_utf8_lossy(&text), &log_path)?;
-    }
+    let log_path = scenario_output.output_dir.join(scenario_output.log_path());
+    stop_if_disk_full(
+        phase,
+        process_status,
+        || {
+            let mut log = scenario_output.open_log_read()?;
+            log.seek(SeekFrom::Start(log_start))
+                .context("seek to this phase's output in the log")?;
+            let mut text = Vec::new();
+            log.read_to_end(&mut text)
+                .context("read this phase's output from the log")?;
+            Ok(String::from_utf8_lossy(&text).into_owned())
+        },
+        &log_path,
+    )?;
     if let Exit::Failure(code) = process_status
         && argv[1] == "nextest"
         && !NEXTEST_ALLOWED_CODES.contains(&code)
@@ -101,10 +106,21 @@ pub fn run_cargo(
     })
 }
 
-/// Stop with an error if `text`, the output of a failed check or build, says the disk
-/// was full. Other phases and other failures are results, not errors.
-pub(crate) fn stop_if_disk_full(phase: Phase, text: &str, log_path: &Utf8Path) -> Result<()> {
-    if matches!(phase, Phase::Check | Phase::Build) && ran_out_of_disk(text) {
+/// Stop with an error if `phase` is a check or build that failed, and its output says
+/// the disk was full. Other phases and other failures are results, not errors.
+///
+/// This is the one place that decides which phases are checked. `output` reads the
+/// phase's output, and is called only for a phase that is checked.
+pub(crate) fn stop_if_disk_full<T: AsRef<str>>(
+    phase: Phase,
+    process_status: Exit,
+    output: impl FnOnce() -> Result<T>,
+    log_path: &Utf8Path,
+) -> Result<()> {
+    if !matches!(phase, Phase::Check | Phase::Build) || process_status.is_success() {
+        return Ok(());
+    }
+    if ran_out_of_disk(output()?.as_ref()) {
         bail!("the disk is full: cargo {phase} failed; see {log_path}");
     }
     Ok(())
@@ -751,6 +767,30 @@ mod test {
         assert!(ran_out_of_disk(
             "\x1b[1m\x1b[91merror\x1b[0m\x1b[1m: No space left on device (os error 28)\x1b[0m\n"
         ));
+    }
+
+    /// Only a failed check or build is read. A test's own output can say the disk is
+    /// full, and a test that fails is a caught mutant.
+    #[test]
+    fn stop_if_disk_full_reads_only_a_failed_check_or_build() {
+        let log_path = Utf8Path::new("log/x.log");
+        let full = || -> Result<&str> {
+            Ok(if cfg!(windows) {
+                "error: There is not enough space on the disk.\n"
+            } else {
+                "error: No space left on device\n"
+            })
+        };
+        let unread = || -> Result<&str> { bail!("the output was read") };
+        for phase in [Phase::Check, Phase::Build] {
+            let err = stop_if_disk_full(phase, Exit::Failure(101), full, log_path).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!("the disk is full: cargo {phase} failed; see log/x.log")
+            );
+            stop_if_disk_full(phase, Exit::Success, unread, log_path).unwrap();
+        }
+        stop_if_disk_full(Phase::Test, Exit::Failure(101), unread, log_path).unwrap();
     }
 
     #[test]

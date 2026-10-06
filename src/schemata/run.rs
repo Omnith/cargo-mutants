@@ -288,9 +288,7 @@ impl Runner<'_> {
         check_interrupted()?;
         let log_path = log.output_dir.join(log.log_path());
         let text = read_to_string(&log_path)?;
-        if !process_status.is_success() {
-            stop_if_disk_full(phase, &text, &log_path)?;
-        }
+        stop_if_disk_full(phase, process_status, || Ok(text.as_str()), &log_path)?;
         Ok((
             PhaseResult {
                 phase,

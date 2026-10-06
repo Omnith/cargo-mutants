@@ -689,9 +689,17 @@ fn main() -> Result<ExitCode> {
             output_dir.write_previously_caught(&previously_caught)?;
         }
         console.set_debug_log(output_dir.open_debug_log()?);
-        report_env_overrides(&env_overrides(&options, |name| env::var(name).ok()));
+        let overrides = env_overrides(&options, |name| env::var(name).ok());
+        report_env_overrides(&overrides);
         let lab_outcome = if use_schemata {
-            schemata::test_mutants(mutants, &workspace, output_dir, &options, &console)?
+            schemata::test_mutants(
+                mutants,
+                &workspace,
+                output_dir,
+                &options,
+                &console,
+                overrides.removed,
+            )?
         } else {
             test_mutants(mutants, &workspace, output_dir, &options, &console)?
         };

@@ -669,12 +669,16 @@ fn fallback_time_by_reason(
 
 /// Test mutants using a schema, falling back to the classic path for mutants that
 /// can't be embedded.
+///
+/// `removed_env` is what the build dirs remove from cargo-mutants' environment, as
+/// `main` reported it. It goes into `schemata.json`.
 pub(crate) fn test_mutants(
     mut mutants: Vec<Mutant>,
     workspace: &Workspace,
     output_dir: OutputDir,
     options: &Options,
     console: &Console,
+    removed_env: BTreeMap<String, String>,
 ) -> Result<LabOutcome> {
     let start_time = Instant::now();
     if let Some(option) = unsupported_option(options) {
@@ -721,7 +725,7 @@ pub(crate) fn test_mutants(
         start_time: Some(Timestamp::now()),
         mutants: mutants.len(),
         jobs: options.jobs.unwrap_or(1),
-        removed_env: crate::cargo::env_overrides(options, |name| std::env::var(name).ok()).removed,
+        removed_env,
         ..Report::default()
     };
     let tests_for_mutant = TestsForMutant::new(options, workspace);
