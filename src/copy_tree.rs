@@ -137,6 +137,20 @@ fn copy_file_preserving_metadata(
     Ok(bytes)
 }
 
+/// True if `path` is cargo's incremental compilation cache for one profile: a directory
+/// named `incremental` beside the profile's `.fingerprint` directory.
+///
+/// A copied cache isn't reused in the new build dir, whose path differs, so copying it
+/// only spends disk. Measured in `docs/work/fallback-build-cost/design.md`, Measured 9.
+/// Fingerprints don't refer to it, so cargo still sees the copied build as fresh.
+fn is_incremental_cache(path: &Path) -> bool {
+    // the name first, so that other entries cost no extra stat
+    path.file_name().is_some_and(|name| name == "incremental")
+        && path
+            .parent()
+            .is_some_and(|parent| parent.join(".fingerprint").is_dir())
+}
+
 /// Copy a cargo `target/` directory into a new build directory, so that cargo can reuse its
 /// build products.
 ///
@@ -155,6 +169,9 @@ pub fn copy_target_dir(src: &Utf8Path, dest: &Utf8Path, console: &Console) -> Re
     let walk = WalkBuilder::new(src)
         .standard_filters(false) // copy hidden and ignored files
         .follow_links(false)
+        .filter_entry(|entry| {
+            !(entry.file_type().is_some_and(|ft| ft.is_dir()) && is_incremental_cache(entry.path()))
+        })
         .build();
     for entry in walk {
         check_interrupted()?;
@@ -245,6 +262,8 @@ pub fn copy_tree(
                 && name != "mutants.out.old"
                 && (copy_target || !is_top_level_target)
                 && (copy_vcs || !VCS_DIRS.contains(&name.as_ref()))
+                && !(entry.file_type().is_some_and(|ft| ft.is_dir())
+                    && is_incremental_cache(entry.path()))
         });
     debug!(?walk_builder);
     for entry in walk_builder.build() {
@@ -745,6 +764,73 @@ mod test {
             assert_eq!(read_to_string(dest.join(name))?, name);
             assert_eq!(mtime(dest.join(name).as_std_path()), OLD_MTIME, "{name}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn copy_target_dir_skips_incremental_caches_beside_fingerprints() -> Result<()> {
+        let tmp = TempDir::new().unwrap();
+        let root = Utf8PathBuf::try_from(tmp.path().to_owned()).unwrap();
+        let src = root.join("target");
+        let profile_dirs = ["debug", "x86_64-unknown-linux-gnu/debug"];
+        for profile_dir in profile_dirs {
+            let profile_dir = src.join(profile_dir);
+            create_dir_all(profile_dir.join(".fingerprint/foo-1234"))?;
+            write(
+                profile_dir.join(".fingerprint/foo-1234/lib-foo"),
+                "fingerprint",
+            )?;
+            create_dir_all(profile_dir.join("incremental/foo-1234"))?;
+            write(profile_dir.join("incremental/foo-1234/cache"), "cache")?;
+        }
+        // A test's own scratch directory that happens to be called `incremental`.
+        create_dir_all(src.join("tmp/x/incremental"))?;
+        write(src.join("tmp/x/incremental/data"), "test data")?;
+        let dest = root.join("new/target");
+        create_dir(root.join("new"))?;
+
+        copy_target_dir(&src, &dest, &Console::new())?;
+
+        for profile_dir in profile_dirs {
+            let profile_dir = dest.join(profile_dir);
+            assert!(!profile_dir.join("incremental").exists(), "{profile_dir}");
+            assert!(
+                profile_dir.join(".fingerprint/foo-1234/lib-foo").is_file(),
+                "{profile_dir}"
+            );
+        }
+        assert!(dest.join("tmp/x/incremental/data").is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn copy_tree_with_copy_target_skips_incremental_caches_beside_fingerprints() -> Result<()> {
+        let tmp_dir = TempDir::new().unwrap();
+        let tmp = Utf8PathBuf::try_from(tmp_dir.path().to_owned()).unwrap();
+        create_dir_all(tmp.join("target/debug/.fingerprint/foo-1234"))?;
+        write(
+            tmp.join("target/debug/.fingerprint/foo-1234/lib-foo"),
+            "fingerprint",
+        )?;
+        create_dir_all(tmp.join("target/debug/incremental/foo-1234"))?;
+        write(tmp.join("target/debug/incremental/foo-1234/cache"), "cache")?;
+        // A test's own scratch directory that happens to be called `incremental`.
+        create_dir_all(tmp.join("target/tmp/x/incremental"))?;
+        write(tmp.join("target/tmp/x/incremental/data"), "test data")?;
+        write(tmp.join("Cargo.toml"), "[package]\nname = a")?;
+        create_dir(tmp.join("src"))?;
+        write(tmp.join("src/main.rs"), "fn main() {}")?;
+
+        let options = Options::from_arg_strs(["mutants", "--copy-target=true"]);
+        let dest_tmpdir = copy_tree(&tmp, "a", &options, &Console::new())?;
+        let dest = dest_tmpdir.path();
+
+        assert!(!dest.join("target/debug/incremental").exists());
+        assert!(
+            dest.join("target/debug/.fingerprint/foo-1234/lib-foo")
+                .is_file()
+        );
+        assert!(dest.join("target/tmp/x/incremental/data").is_file());
         Ok(())
     }
 
