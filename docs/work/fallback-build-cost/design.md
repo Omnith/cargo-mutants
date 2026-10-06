@@ -420,8 +420,10 @@ through the existing `serde_json` parsing style of `src/schemata/diagnostics.rs`
 own source holds the markers as literals, and its CI runs cargo-mutants on itself, so the quoted
 source rule is not optional.
 
-**`Worker::run_queue` empties the queue on an error** from `run_one_scenario`, under the queue's
-lock, then returns the error. `run_cargo` and
+**A worker thread in `run_mutants` empties the queue on any error**, under the queue's lock, then
+returns the error. That covers a failed copy of the workspace as well as a failed scenario.
+**This said `Worker::run_queue` emptied it, which was wrong:** a copy that failed because the disk
+was full returned before `run_queue` ran, and left the queue full. `run_cargo` and
 `Runner::run_step` call it only for a failed check or build phase, and return an error that names
 the disk and the log path. The text of a phase is what it appended to the scenario's log, not the
 whole log, so an earlier phase's output cannot match.
