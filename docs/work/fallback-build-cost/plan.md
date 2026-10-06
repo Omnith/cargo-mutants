@@ -1359,7 +1359,7 @@ run would record mutants unviable without a word. Record `uptime` after each run
     both pairs with their load averages to the orchestrator, which takes it to Kane. Do not
     change the threshold.
 
-- [ ] **Step 5: tear down** what this task made, and report the free space before and after.
+- [x] **Step 5: tear down** what this task made, and report the free space before and after.
 
 ```
 cd <scratch>/jast && COMPOSE_PROJECT_NAME=rbp-fbc docker compose --profile s3 down -v
@@ -1369,10 +1369,6 @@ git -C ~/repos/cargo-mutants worktree remove --force <scratch>/fork-old
 
 Keep the five `out-<run>/mutants.out/schemata.json` and `outcomes.json` files. Delete the rest of
 each output directory.
-
-Open: the compose project is down, with its volumes. The session's permission classifier refused
-the two `worktree remove --force` lines and the trim of each `out-<run>`, so Batch D's implementer
-left them for the orchestrator.
 
 - [x] **Step 6: write `docs/work/fallback-build-cost/impl.md`.** It holds what shipped, the
   table of the five runs with their load averages, and each criterion with its evidence. It has no
