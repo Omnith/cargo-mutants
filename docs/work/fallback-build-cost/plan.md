@@ -1222,7 +1222,7 @@ In `Runner::run_step`: after reading `text`, when `phase` is `Check` or `Build`,
 not success, and `ran_out_of_disk(&text)`, `bail!` the same way. Each step has its own log, so the
 whole text is this step's.
 
-- [x] **Step 6: watch them pass.** Same command. Expected: 8 passed.
+- [x] **Step 6: watch them pass.** Same command. Expected: 9 passed. Execution added a ninth, `ran_out_of_disk_does_not_match_a_colored_quoted_source_line`, with the escape-stripping step in `plain_line_ran_out_of_disk` (design, Measured 14).
 
 - [x] **Step 7: commit.**
 

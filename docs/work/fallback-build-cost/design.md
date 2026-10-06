@@ -267,6 +267,12 @@ space on the disk. (os error 112)` for `ERROR_DISK_FULL`. Both reach a classic m
   on one worker and exited 1.
 - **Removing `CARGO_INCREMENTAL=1` turns incremental off** when the profile says
   `incremental = false`: `cargo build -v` gave one `incremental=` line with it and none without.
+- **A colored quoted line starts with an escape sequence, not its line number.** Found in
+  Batch B's execution, 2026-10-05. Under `CARGO_TERM_COLOR=always`, which the fork's own CI sets
+  (`.github/workflows/tests.yml:38`), `od -c` on a classic `disk_full_literal` log showed the
+  quoted line as `033[1m033[94m12033[0m 033[1m033[94m|033[0m`. The quoted source rule did not
+  see a line number, so the line counted as a full disk. The integration tests cannot show it,
+  because their `run()` strips `CARGO_TERM_COLOR`.
 
 Re-derive Measured 1 and 2: read the named key from `mutants.out/schemata.json`, or sum
 `phase_results[].duration` by phase in `outcomes.json` for the mutants named in
@@ -342,6 +348,8 @@ so the check reads only what the toolchain says, never what it quotes:
 - A cargo JSON compiler message counts only through its `message` and its children's `message`
   fields. Its `rendered` text and its spans quote source.
 - Another JSON line, such as an artifact notice, never counts.
+- A plain line loses its ANSI control sequences first, because cargo colors its output under
+  `CARGO_TERM_COLOR=always` (Measured 14).
 - A plain line counts unless rustc is quoting source on it: a line that, trimmed of leading
   space, starts with `|`, or with digits followed by ` |`, ` -`, ` +` or ` ~`.
 - The markers are `No space left on device` and `(os error 28)` (macOS and Linux, `ENOSPC`),
@@ -453,8 +461,8 @@ three reports and the disk-full stop.
    - Unit tests of the detector. Each marker of Measured 13 and 14 matches, including the macOS
      linker's note and a JSON compiler message whose own `message` is rustc's ENOSPC text. A
      compile error that does not mention the disk does not match, nor does empty text. Neither
-     does a quoted source line in each form: a `NN |` line, a `NN -` suggestion line, and a
-     JSON compiler message that holds the marker only in its `rendered` text and spans.
+     does a quoted source line in each form: a `NN |` line, a `NN -` suggestion line, a colored
+     `NN |` line, and a JSON compiler message that holds the marker only in its `rendered` text and spans.
    - Integration tests on a testdata tree with several functions. Its build script prints
      `No space left on device` and fails only when one mutation is present. Run with
      `--no-schemata -j2 --no-shuffle` and with `--schemata`. cargo-mutants exits non-zero, its
