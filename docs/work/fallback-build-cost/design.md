@@ -312,8 +312,11 @@ $ perl -e 'for (122, 69, 28, 39) { $! = $_; print "$_: $!\n" }'
 69: Srmount error
 28: No space left on device
 39: Directory not empty
+$ ./e    # prints io::Error::from_raw_os_error for 122, 69, 28 and 39
 Disk quota exceeded (os error 122)
 Srmount error (os error 69)
+No space left on device (os error 28)
+Directory not empty (os error 39)
 ```
 
 The same Rust program on the Mac printed `Disc quota exceeded (os error 69)` and
@@ -490,9 +493,9 @@ was full returned before `run_queue` ran, and left the queue full.
 **`stop_if_disk_full` alone decides which phases are checked.** `run_cargo` and
 `Runner::run_step` pass it the phase, the exit status, a reader of the phase's output and the log
 path. It calls the reader only for a failed check or build, and returns an error that names the
-disk and the log path and quotes the line that matched. The text of a phase is what it appended to the scenario's log, not the
-whole log. The log also holds an earlier phase's output and the mutation's diff, and neither may
-match.
+disk and the log path and quotes the line that matched. The text of a phase is what it appended
+to the scenario's log, not the whole log. The log also holds an earlier phase's output and the
+mutation's diff, and neither may match.
 
 **Environment overrides are reported once per run, never per command.** `build_dir_cargo_env`
 runs for every spawned process, including every replayed test command. Its existing
@@ -538,10 +541,11 @@ three reports and the disk-full stop.
    - Unit tests of the detector. Each marker of Measured 13 and 14 matches on its own, on the
      platform that has it. So do the macOS linker's note, as a plain line and in a JSON child
      `message`, and a JSON compiler message whose own `message` is rustc's ENOSPC text. Another
-     platform's error code does not match. A linker failure without `errno=28` does not match, nor does `errno=28` without `ld:`. A
+     platform's error code does not match. A linker failure without `errno=28` does not match,
+     nor does `errno=28` without `ld:`. A
      compile error that does not mention the disk does not match, nor does empty text. Neither
-     does a quoted source line in each form: a `NN |` line, a `NN -`, `NN +` and `NN ~` suggestion line, a colored
-     `NN |` line, a build script's warning that forwards a gutter line, and a JSON compiler message
+     does a quoted source line in each form: a `NN |` line, a `NN -`, `NN +` and `NN ~`
+     suggestion line, a colored `NN |` line, a build script's warning that forwards a gutter line, and a JSON compiler message
      that holds the marker only in its `rendered` text and spans. A build script's warning that
      forwards the error itself does match.
    - Integration tests on a testdata tree with several functions. Its build script prints
