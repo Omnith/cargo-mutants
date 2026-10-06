@@ -98,8 +98,9 @@ Batches A to C folded each finding into the plan or the design before the next b
 
 ## Review findings
 
-The code review of pull request 1, folded on 2026-10-05. Each fold that adds a guard was first
-watched to fail, by a new test or by a hand probe that was then reversed from a saved copy.
+The code review of pull request 1 and its adversarial review, both folded on 2026-10-05. Each fold
+that adds a guard was first watched to fail, by a new test or by a hand probe that was then
+reversed from a saved copy.
 
 | Finding | Severity | What changed | Commit |
 |---|---|---|---|
@@ -113,6 +114,7 @@ watched to fail, by a new test or by a hand probe that was then reversed from a 
 | **The phase guard sat in two places**, which made `run_cargo`'s copy an equivalent mutant. `schemata::test_mutants` recomputed the overrides `main` had computed | LOW (L6) | `stop_if_disk_full` takes the phase, the exit status and a reader of the output, and calls the reader only for a failed check or build. New test `stop_if_disk_full_reads_only_a_failed_check_or_build`. `main` passes `removed` to `schemata::test_mutants` | `f4e32dd` |
 | **`NEWS.md` overclaimed.** It said source holding the message never triggers the stop. A user's own text inside a diagnostic, such as a `#[deprecated(note = "...")]` message or a `const` panic message, can | LOW (L2) | `NEWS.md` names only source lines that rustc quotes. The book made no such claim. The detector is unchanged | `575fafd` |
 | **The stop's exit code was not stated** | LOW (L5) | The design's Approach says it exits 1, as every internal error does, and why | `575fafd` |
+| **A build script's replayed warning stopped a healthy run.** cargo prints it as `warning: <package>@<version>: <text>` and replays it on every later build. cc-rs forwards a C compiler's quoted source that way, so `warning: p3@0.1.0:     3 \|     ... "No space left on device";` read as a full disk on both paths | MEDIUM (adversarial A1) | The plain-line check strips that prefix before the quoted source and marker checks. `ran_out_of_disk` returns the line that matched, and the stop's error quotes it. New tests `ran_out_of_disk_reads_a_build_script_warning_without_its_prefix` and `without_build_script_prefix_takes_off_only_a_package_and_version`. Design Measured 15 | A1 |
 
 Not folded, by the orchestrator's decision: filling `<NAME>` in the console line, and `env::var`
 against `env::var_os` in the report.

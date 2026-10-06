@@ -274,6 +274,24 @@ space on the disk. (os error 112)` for `ERROR_DISK_FULL`. Both reach a classic m
   see a line number, so the line counted as a full disk. The integration tests cannot show it,
   because their `run()` strips `CARGO_TERM_COLOR`.
 
+**15. What cargo prints for a build script's warning.** Found by the pull request's adversarial
+review, 2026-10-05: with `cc = "=1.4.7"`, a C compiler's warning that quoted
+`"No space left on device"` stopped both paths with "the disk is full". Measured on cargo
+1.96.0 the same day, with a scratch crate whose build script prints two `cargo:warning=` lines and
+`cargo:rerun-if-changed=build.rs`:
+
+```
+warning: p3@0.1.0:     3 |     const char *unused_fallback = "No space left on device";
+warning: p3@0.1.0: error: could not write /t/x.o: No space left on device
+```
+
+- A later build that does not run the build script prints both lines again.
+- Under `CARGO_TERM_COLOR=always` the prefix is `033[1m033[33mwarning033[0m: p3@0.1.0: `.
+  Without its escape sequences it is the same prefix.
+- With `--message-format=json` the same plain lines go to stderr.
+- A build script that fails also prints its output raw, under `--- stdout`:
+  `  cargo:warning=    3 |     const char ...`. The prefix rule does not reach that line.
+
 Re-derive Measured 1 and 2: read the named key from `mutants.out/schemata.json`, or sum
 `phase_results[].duration` by phase in `outcomes.json` for the mutants named in
 `fallback_mutants`. Re-derive Measured 6, 7 and 9: the probe scripts mutate one line, time the
@@ -342,7 +360,8 @@ reports the disk full, the phase returns an error instead of a result (Measured 
 The run then stops the way any internal error stops it: the mutant is reverted, `main` returns
 the error, and the process exits non-zero. It exits 1, as every internal error does, and gets no
 exit code of its own: a full disk is an error, not a result, so it takes the path every other
-error takes. The message names the full disk and the phase's log.
+error takes. The message names the full disk and the phase's log, and quotes the line that
+matched, so a false stop explains itself.
 A gate that checks its population against the outcomes then fails on the partial run as well.
 
 **What counts as the disk reporting full.** The text of a source line can hold the same words,
@@ -353,6 +372,9 @@ so the check reads only what the toolchain says, never what it quotes:
 - Another JSON line, such as an artifact notice, never counts.
 - A plain line loses its ANSI control sequences first, because cargo colors its output under
   `CARGO_TERM_COLOR=always` (Measured 14).
+- A plain line then loses cargo's prefix for a build script's warning,
+  `warning: <package>@<version>: `. cargo replays a build script's warnings on every later build,
+  and cc-rs forwards a C compiler's diagnostics that way, quoted source included (Measured 15).
 - A plain line counts unless rustc is quoting source on it: a line that, trimmed of leading
   space, starts with `|`, or with digits, one or more spaces, and one of `|`, `-`, `+` or `~`
   followed by a space or the end of the line.
@@ -367,6 +389,9 @@ so the check reads only what the toolchain says, never what it quotes:
   container, so a host that is down read as a full disk. With `--message-format=json`, which
   the schema's build uses, rustc puts the linker's note in a child `message`, so a full disk at
   link time made every embedded mutant fall back as an unattributed compile error.
+- **This rule read a build script's warning whole, which was wrong.** cargo's prefix hid a
+  forwarded gutter line from the quoted source rule, so a C compiler's quoted source stopped a
+  healthy run (Measured 15).
 
 **One worker's disk-full error stops the others.** A worker that gets the error empties the
 shared queue before it returns, so every other worker finishes the mutant it holds and takes no
@@ -430,7 +455,7 @@ was full returned before `run_queue` ran, and left the queue full.
 **`stop_if_disk_full` alone decides which phases are checked.** `run_cargo` and
 `Runner::run_step` pass it the phase, the exit status, a reader of the phase's output and the log
 path. It calls the reader only for a failed check or build, and returns an error that names the
-disk and the log path. The text of a phase is what it appended to the scenario's log, not the
+disk and the log path and quotes the line that matched. The text of a phase is what it appended to the scenario's log, not the
 whole log. The log also holds an earlier phase's output and the mutation's diff, and neither may
 match.
 
@@ -481,7 +506,9 @@ three reports and the disk-full stop.
      platform's error code does not match. A linker failure without `errno=28` does not match. A
      compile error that does not mention the disk does not match, nor does empty text. Neither
      does a quoted source line in each form: a `NN |` line, a `NN -` suggestion line, a colored
-     `NN |` line, and a JSON compiler message that holds the marker only in its `rendered` text and spans.
+     `NN |` line, a build script's warning that forwards a gutter line, and a JSON compiler message
+     that holds the marker only in its `rendered` text and spans. A build script's warning that
+     forwards the error itself does match.
    - Integration tests on a testdata tree with several functions. Its build script prints
      `No space left on device` and fails only when one mutation is present. Run with
      `--no-schemata -j2 --no-shuffle` and with `--schemata`. cargo-mutants exits non-zero, its
