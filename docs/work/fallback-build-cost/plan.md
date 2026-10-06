@@ -120,7 +120,7 @@ than fixing it.
 `run_cargo`, `src/schemata/run.rs` (`run_step`, `run_test_command`, the `cargo test` path near
 `:999`), `src/schemata/coverage/collect.rs` (`:405` through `run_step`, `:512` directly).
 
-- [ ] **Step 1: write the failing tests** at the end of `src/process.rs`, beside `mod test`.
+- [x] **Step 1: write the failing tests** at the end of `src/process.rs`, beside `mod test`.
 
 ```rust
 #[cfg(all(test, unix))]
@@ -197,7 +197,7 @@ mod env_test {
 The first test is the presence half. Without it, the second passes on a child that sees nothing
 at all.
 
-- [ ] **Step 2: run them and watch them fail to compile on the missing `Env`.**
+- [x] **Step 2: run them and watch them fail to compile on the missing `Env`.**
 
 ```
 cargo nextest run --all-features -E 'test(/env_test::/)'
@@ -205,7 +205,7 @@ cargo nextest run --all-features -E 'test(/env_test::/)'
 
 Expected: error `cannot find type Env`, or `unresolved import super::Env`.
 
-- [ ] **Step 3: add `Env` to `src/process.rs`**, above `pub struct Process`.
+- [x] **Step 3: add `Env` to `src/process.rs`**, above `pub struct Process`.
 
 ```rust
 /// Environment changes for a child process, relative to cargo-mutants' own environment.
@@ -225,7 +225,7 @@ INTENT: `Process::run` and `Process::start` take `env: &Env` in place of
 `env: &[(String, String)]`. In `start`, call `command.env_remove(name)` for each `remove` entry,
 then `command.envs(...)` over `set`, before `stdin`. Keep the debug span unchanged.
 
-- [ ] **Step 4: change every caller to build an `Env`**, with `set` holding what it passed before
+- [x] **Step 4: change every caller to build an `Env`**, with `set` holding what it passed before
   and `remove` empty. Behaviour is unchanged in this task. Callers:
   - `run_cargo` passes `&Env { set: build_dir_cargo_env(...), remove: Vec::new() }` for now.
   - `Runner::cargo_env` and `Runner::test_env` keep returning `Vec<(String, String)>` for now.
@@ -234,7 +234,7 @@ then `command.envs(...)` over `set`, before `stdin`. Keep the debug span unchang
     way.
   - `collect.rs` `:512` wraps its `env`.
 
-- [ ] **Step 5: run the three tests and watch them pass.**
+- [x] **Step 5: run the three tests and watch them pass.**
 
 ```
 cargo nextest run --all-features -E 'test(/env_test::/)'
@@ -242,7 +242,7 @@ cargo nextest run --all-features -E 'test(/env_test::/)'
 
 Expected: 3 passed.
 
-- [ ] **Step 6: commit.**
+- [x] **Step 6: commit.**
 
 ```
 cargo fmt && cargo clippy --all-targets --all-features -- -D warnings
@@ -258,7 +258,7 @@ git commit -m 'Let a child process have inherited variables removed' -- src/proc
 `run_test_command` `:669`), `src/schemata/coverage/collect.rs` (`:391-404`, `:501-505`),
 `tests/main.rs`.
 
-- [ ] **Step 1: write the failing unit tests** in `src/cargo.rs`'s `mod test`, beside
+- [x] **Step 1: write the failing unit tests** in `src/cargo.rs`'s `mod test`, beside
   `build_dir_cargo_env_sets_cargo_target_dir_to_own_target_except_in_place`.
 
 ```rust
@@ -306,7 +306,7 @@ fn incremental_switches_that_turn_incremental_on_or_are_unset_are_kept() {
 The existing test reads the set half: change its `.into_iter()` to `.set.into_iter()`. It
 asserts the same values as before.
 
-- [ ] **Step 2: write the failing integration tests** in `tests/main.rs`, after
+- [x] **Step 2: write the failing integration tests** in `tests/main.rs`, after
   `cargo_target_dir_from_environment_is_not_used_by_schemata_build`.
 
 ```rust
@@ -464,13 +464,15 @@ fn coverage_build_is_not_incremental_in_test_selection_coverage_tree() {
 }
 ```
 
-- [ ] **Step 3: watch them fail.**
+- [x] **Step 3: watch them fail.**
 
 ```
 cargo nextest run --all-features -E 'test(/incremental_switches_that_turn/) | test(/incremental_switches_from_environment/) | test(/incremental_off_in_the_profile/) | test(/coverage_build_is_not_incremental/)'
 ```
 
-Expected: 6 run.
+Expected: none run. This said "6 run", which was wrong: a unit test that does not compile stops
+the whole build, so nextest runs nothing. Run the same filter with `--test main` added to see the
+four integration tests' RED while the unit tests do not compile.
 - The unit tests fail to compile on the missing `incremental_switches_to_remove`. Record the
   error.
 - `incremental_switches_..._build_dirs` and `..._schemata_build` fail on the `-C incremental=`
@@ -482,7 +484,7 @@ Expected: 6 run.
   llvm-tools is missing it prints `SKIPPED` and proves nothing. Install them with
   `rustup component add llvm-tools` before you run it.
 
-- [ ] **Step 4: implement.**
+- [x] **Step 4: implement.**
 
 In `src/cargo.rs`, beside `build_dir_cargo_env`:
 
@@ -546,10 +548,10 @@ and with `("CARGO_INCREMENTAL", "0")`. Add one comment line above it:
 
 `:501`: extend `env.set` as today.
 
-- [ ] **Step 5: watch them pass.** Same command as Step 3. Expected: 6 passed, or 5 and one
+- [x] **Step 5: watch them pass.** Same command as Step 3. Expected: 6 passed, or 5 and one
   `SKIPPED` only if llvm-tools cannot be installed. Report that case.
 
-- [ ] **Step 6: commit.**
+- [x] **Step 6: commit.**
 
 ```
 cargo fmt && cargo clippy --all-targets --all-features -- -D warnings
@@ -563,7 +565,7 @@ git commit -m 'Remove inherited incremental switches in scratch build dirs' -- s
 **Files:** modify `src/copy_tree.rs` (`copy_target_dir` `:148`, `copy_tree`'s `filter_entry`
 `:237-248`, `mod test`).
 
-- [ ] **Step 1: write the failing tests** in `src/copy_tree.rs`'s `mod test`, after
+- [x] **Step 1: write the failing tests** in `src/copy_tree.rs`'s `mod test`, after
   `copy_target_dir_copies_nested_and_hidden_files_preserving_mtime`.
 
 ```rust
@@ -626,7 +628,7 @@ fn copy_tree_with_copy_target_skips_incremental_caches_beside_fingerprints() -> 
 }
 ```
 
-- [ ] **Step 2: watch them fail.**
+- [x] **Step 2: watch them fail.**
 
 ```
 cargo nextest run --all-features -E 'test(/skips_incremental_caches_beside_fingerprints/)'
@@ -634,7 +636,7 @@ cargo nextest run --all-features -E 'test(/skips_incremental_caches_beside_finge
 
 Expected: 2 run, 2 fail on the `!...incremental...exists()` assertion.
 
-- [ ] **Step 3: implement.** In `src/copy_tree.rs`, above `copy_target_dir`:
+- [x] **Step 3: implement.** In `src/copy_tree.rs`, above `copy_target_dir`:
 
 ```rust
 /// True if `path` is cargo's incremental compilation cache for one profile: a directory
@@ -651,7 +653,7 @@ stat `parent/.fingerprint`, so the walk does no extra stat for other entries. In
 which this is true. In `copy_tree`, add `&& !is_incremental_cache(entry.path())` to the existing
 `filter_entry`, gated on the entry being a directory.
 
-- [ ] **Step 4: watch them pass.** Same command. Expected: 2 passed. Then run the module's other
+- [x] **Step 4: watch them pass.** Same command. Expected: 2 passed. Then run the module's other
   tests:
 
 ```
@@ -660,14 +662,14 @@ cargo nextest run --all-features -E 'test(/copy_tree::/)'
 
 Expected: every test passes. Quote the count.
 
-- [ ] **Step 5: commit.**
+- [x] **Step 5: commit.**
 
 ```
 cargo fmt && cargo clippy --all-targets --all-features -- -D warnings
 git commit -m 'Skip incremental caches when seeding a build dir' -- src/copy_tree.rs
 ```
 
-- [ ] **Batch A end:** `df -h ~/repos`, then the whole suite with
+- [x] **Batch A end:** `df -h ~/repos`, then the whole suite with
   `cargo nextest run --all-features`. Report pass, fail and skip counts. Report the RED line of
   each new test.
 
@@ -761,8 +763,9 @@ where `let assert = run()...timeout(OUTER_TIMEOUT).assert().success();`.
 cargo nextest run --all-features -E 'test(/env_overrides_/) | test(/incremental_switches_from_environment_are_not_inherited_by_schemata_build/)'
 ```
 
-Expected: 3 run. The unit tests fail to compile on `env_overrides`. The integration test fails on
-`removed_env` being `null`.
+Expected: none run, because the unit tests fail to compile on `env_overrides`. This said "3 run",
+which was wrong for the reason Task 2 Step 3 gives. Add `--test main` to the same filter to see the
+integration test fail on `removed_env` being `null`.
 
 - [ ] **Step 5: implement** in `src/cargo.rs`, beside `INCREMENTAL_SWITCHES`:
 
