@@ -5892,3 +5892,63 @@ fn coverage_build_is_not_incremental_in_test_selection_coverage_tree() {
         "{coverage_lines:?}"
     );
 }
+
+/// A build that fails because the disk is full stops the run with an error, rather than
+/// recording the mutant as unviable: a full disk must not hide a missed mutant.
+fn assert_disk_full_stops_the_run(args: &[&str]) -> TempDir {
+    let tmp = copy_of_testdata("disk_full_build");
+    let out = tempdir().unwrap();
+    let assert = run()
+        .args(["mutants", "--no-times"])
+        .args(args)
+        .arg("-d")
+        .arg(tmp.path())
+        .arg("-o")
+        .arg(out.path())
+        .timeout(OUTER_TIMEOUT)
+        .assert()
+        .failure();
+    let output = String::from_utf8_lossy(&assert.get_output().stdout).into_owned()
+        + &String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(output.contains("the disk is full"), "{output}");
+    let unviable = read_to_string(out.path().join("mutants.out/unviable.txt")).unwrap_or_default();
+    assert_eq!(unviable, "");
+    out
+}
+
+/// With two jobs, the worker that hits a full disk stops the other one too: the run
+/// doesn't test every remaining mutant before it fails.
+#[test]
+fn a_build_that_runs_out_of_disk_stops_the_run_in_disk_full_build_tree_without_schemata() {
+    let out = assert_disk_full_stops_the_run(&["--no-schemata", "-j2", "--no-shuffle"]);
+    let started = mutant_logs(&out.path().join("mutants.out")).len();
+    assert!(
+        (1..=4).contains(&started),
+        "the second worker stopped after the mutant it held: {started} mutants started"
+    );
+}
+
+#[test]
+fn a_build_that_runs_out_of_disk_stops_the_run_in_disk_full_build_tree_with_schemata() {
+    assert_disk_full_stops_the_run(&["--schemata"]);
+}
+
+/// Source that holds a full disk's message as text is quoted in compile errors and
+/// warnings. That's not the disk, so the run goes on.
+#[test]
+fn source_holding_the_disk_full_message_does_not_stop_the_run_in_disk_full_literal_tree() {
+    for schemata in ["--no-schemata", "--schemata"] {
+        let tmp = copy_of_testdata("disk_full_literal");
+        let out = tempdir().unwrap();
+        run()
+            .args(["mutants", "--no-times", schemata, "-d"])
+            .arg(tmp.path())
+            .arg("-o")
+            .arg(out.path())
+            .timeout(OUTER_TIMEOUT)
+            .assert()
+            .success();
+        let unviable = read_to_string(out.path().join("mutants.out/unviable.txt")).unwrap();
+        assert_eq!(unviable.lines().count(), 2, "{schemata}: {unviable}");
+    }
+}

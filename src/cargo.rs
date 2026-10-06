@@ -5,12 +5,17 @@
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::env;
+use std::io::{Read, Seek, SeekFrom};
 use std::iter::once;
 use std::time::{Duration, Instant};
 
+use anyhow::{Context, bail};
+use camino::Utf8Path;
 use nextest_metadata::NextestExitCode;
+use serde_json::Value;
 use tracing::{debug, debug_span, info, warn};
 
 use crate::Result;
@@ -34,6 +39,9 @@ const NEXTEST_ALLOWED_CODES: &[i32] = &[
 /// Run cargo build, check, or test.
 ///
 /// When testing, if any of `stop_on_failure` fail, the tests are stopped.
+///
+/// A check or build that fails because the disk is full is an error, not a result: as a
+/// result it would make the mutant unviable, and a full disk would hide a missed mutant.
 #[allow(clippy::too_many_arguments)] // I agree it's a lot but I'm not sure wrapping in a struct would be better.
 pub fn run_cargo(
     build_dir: &BuildDir,
@@ -49,6 +57,12 @@ pub fn run_cargo(
     let _span = debug_span!("run", ?phase).entered();
     let start = Instant::now();
     let argv = cargo_argv(packages, phase, options);
+    // the log holds earlier phases too: only what this phase appends is read
+    let log_start = scenario_output
+        .log_file
+        .metadata()
+        .context("read the log's length")?
+        .len();
     let process_status = Process::run(
         &argv,
         &build_dir_cargo_env(build_dir, options),
@@ -61,6 +75,16 @@ pub fn run_cargo(
     )?;
     check_interrupted()?;
     debug!(?process_status, elapsed = ?start.elapsed());
+    if matches!(phase, Phase::Check | Phase::Build) && !process_status.is_success() {
+        let mut log = scenario_output.open_log_read()?;
+        log.seek(SeekFrom::Start(log_start))
+            .context("seek to this phase's output in the log")?;
+        let mut text = Vec::new();
+        log.read_to_end(&mut text)
+            .context("read this phase's output from the log")?;
+        let log_path = scenario_output.output_dir.join(scenario_output.log_path());
+        stop_if_disk_full(phase, &String::from_utf8_lossy(&text), &log_path)?;
+    }
     if let Exit::Failure(code) = process_status
         && argv[1] == "nextest"
         && !NEXTEST_ALLOWED_CODES.contains(&code)
@@ -75,6 +99,112 @@ pub fn run_cargo(
         process_status,
         argv,
     })
+}
+
+/// Stop with an error if `text`, the output of a failed check or build, says the disk
+/// was full. Other phases and other failures are results, not errors.
+pub(crate) fn stop_if_disk_full(phase: Phase, text: &str, log_path: &Utf8Path) -> Result<()> {
+    if matches!(phase, Phase::Check | Phase::Build) && ran_out_of_disk(text) {
+        bail!("the disk is full: cargo {phase} failed; see {log_path}");
+    }
+    Ok(())
+}
+
+/// Text in the operating system's message for a full disk.
+const DISK_FULL_MARKERS: [&str; 4] = [
+    // macOS and Linux: the text and the code of `ENOSPC`
+    "No space left on device",
+    "(os error 28)",
+    // windows: `ERROR_DISK_FULL`, whose text is localized and whose code is not
+    "There is not enough space on the disk",
+    "(os error 112)",
+];
+
+/// True if `text`, written by a failed cargo command, says the disk was full.
+///
+/// rustc, the archiver and cargo itself print the operating system's message for the
+/// error: the same text on macOS and Linux, and another on Windows. Measured by filling a
+/// disk image: `docs/work/fallback-build-cost/design.md`, Measured 13.
+pub(crate) fn ran_out_of_disk(text: &str) -> bool {
+    text.lines().any(|line| {
+        match line
+            .starts_with('{')
+            .then(|| serde_json::from_str::<Value>(line).ok())
+            .flatten()
+        {
+            Some(value) => compiler_message_ran_out_of_disk(&value),
+            None => plain_line_ran_out_of_disk(line),
+        }
+    })
+}
+
+/// True if a JSON line from cargo is a compiler message whose own text, or a child's,
+/// says the disk was full. Its `rendered` text and its spans quote source, so they are
+/// never read. Any other JSON line never counts.
+fn compiler_message_ran_out_of_disk(value: &Value) -> bool {
+    if value["reason"] != "compiler-message" {
+        return false;
+    }
+    let diagnostic = &value["message"];
+    once(diagnostic)
+        .chain(diagnostic["children"].as_array().into_iter().flatten())
+        .filter_map(|message| message["message"].as_str())
+        .any(holds_disk_full_marker)
+}
+
+/// True if a line of plain output says the disk was full, and rustc is not quoting
+/// source on it.
+fn plain_line_ran_out_of_disk(line: &str) -> bool {
+    let line = without_ansi_escapes(line);
+    if quotes_source(&line) {
+        return false;
+    }
+    // the macOS linker gives only the error number
+    holds_disk_full_marker(&line) || (line.contains("ld:") && line.contains("errno=28"))
+}
+
+fn holds_disk_full_marker(text: &str) -> bool {
+    DISK_FULL_MARKERS.iter().any(|marker| text.contains(marker))
+}
+
+/// True if rustc is quoting source on `line`: a gutter line that starts with `|`, or a
+/// numbered source or suggestion line, such as `30 |`, `4 -` or `4 +`.
+fn quotes_source(line: &str) -> bool {
+    let line = line.trim_start();
+    if line.starts_with('|') {
+        return true;
+    }
+    let after_digits = line.trim_start_matches(|c: char| c.is_ascii_digit());
+    let after_spaces = after_digits.trim_start_matches(' ');
+    if after_digits.len() == line.len() || after_spaces.len() == after_digits.len() {
+        return false;
+    }
+    let mut rest = after_spaces.chars();
+    matches!(rest.next(), Some('|' | '-' | '+' | '~')) && matches!(rest.next(), None | Some(' '))
+}
+
+/// `line` without the escape sequences that color it. Cargo colors its output when
+/// `CARGO_TERM_COLOR=always`, as CI jobs often set, and then a quoted source line starts
+/// with an escape sequence rather than its line number.
+fn without_ansi_escapes(line: &str) -> Cow<'_, str> {
+    if !line.contains('\x1b') {
+        return Cow::Borrowed(line);
+    }
+    let mut plain = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            plain.push(c);
+        } else if chars.next_if_eq(&'[').is_some() {
+            // a control sequence ends with a byte from `@` to `~`
+            for c in chars.by_ref() {
+                if ('@'..='~').contains(&c) {
+                    break;
+                }
+            }
+        }
+    }
+    Cow::Owned(plain)
 }
 
 /// Environment variables set for every cargo invocation.
@@ -341,8 +471,10 @@ fn encoded_rustflags(options: &Options) -> Option<String> {
 #[cfg(test)]
 mod test {
     use clap::Parser;
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
     use rusty_fork::rusty_fork_test;
+    use serde_json::json;
 
     use crate::{
         Args,
@@ -444,6 +576,101 @@ mod test {
             env_overrides(&Options::default(), |_| None),
             EnvOverrides::default()
         );
+    }
+
+    #[test]
+    fn ran_out_of_disk_matches_each_platforms_message() {
+        assert!(ran_out_of_disk(
+            "error: could not write output to /t/deps/x.rcgu.o: No space left on device\n"
+        ));
+        assert!(ran_out_of_disk(
+            "error: No space left on device (os error 28) at path \"/t/check\"\n"
+        ));
+        assert!(ran_out_of_disk(
+            "error: failed to write /t/x: There is not enough space on the disk. (os error 112)\n"
+        ));
+    }
+
+    #[test]
+    fn ran_out_of_disk_does_not_match_a_compile_error_or_nothing() {
+        assert!(!ran_out_of_disk(
+            "error[E0308]: mismatched types\n  --> src/lib.rs:2:5\n"
+        ));
+        assert!(!ran_out_of_disk(""));
+    }
+
+    /// A compile error quotes source lines. cargo-mutants' own source holds the message as a
+    /// literal, and its CI runs cargo-mutants on itself.
+    #[test]
+    fn ran_out_of_disk_does_not_match_a_quoted_source_line() {
+        assert!(!ran_out_of_disk(indoc! {r#"
+            error[E0308]: mismatched types
+              --> src/cargo.rs:30:5
+               |
+            30 |     "No space left on device",
+               |     ^^^^^^^^^^^^^^^^^^^^^^^^^ expected `u8`, found `&str`
+        "#}));
+        assert!(!ran_out_of_disk(indoc! {r#"
+            help: remove the extra argument
+               |
+            4  -     report("No space left on device");
+            4  +     report();
+        "#}));
+    }
+
+    /// The macOS linker reports a full disk by its error number only.
+    #[test]
+    fn ran_out_of_disk_matches_the_macos_linker() {
+        assert!(ran_out_of_disk(indoc! {"
+            error: linking with `cc` failed: exit status: 1
+              = note: ld: ftruncate() failed, errno=28 for '/t/deps/x-1234'
+        "}));
+    }
+
+    /// With `--message-format=json`, which the schema's check and build use, a diagnostic is one
+    /// line. Its own message counts. Its rendered text and spans quote source, so they don't.
+    #[test]
+    fn ran_out_of_disk_reads_only_the_messages_of_a_json_compiler_message() {
+        let full = json!({
+            "reason": "compiler-message",
+            "message": {
+                "level": "error",
+                "message": "could not write output to /t/deps/x.rcgu.o: No space left on device",
+                "children": [],
+                "spans": [],
+                "rendered": "error: could not write output to /t/deps/x.rcgu.o: No space left on device\n",
+            },
+        });
+        assert!(ran_out_of_disk(&full.to_string()));
+        let quoted = json!({
+            "reason": "compiler-message",
+            "message": {
+                "level": "warning",
+                "message": "unused variable: `expected`",
+                "children": [{
+                    "level": "help",
+                    "message": "if this is intentional, prefix it with an underscore: `_expected`",
+                    "children": [],
+                    "spans": [],
+                    "rendered": null,
+                }],
+                "spans": [{"text": [{"text": "    let expected = \"No space left on device\";"}]}],
+                "rendered": "warning: unused variable: `expected`\n --> src/lib.rs:4:9\n  |\n4 |     let expected = \"No space left on device\";\n",
+            },
+        });
+        assert!(!ran_out_of_disk(&quoted.to_string()));
+    }
+
+    /// With `CARGO_TERM_COLOR=always`, which the fork's CI sets, cargo colors its output,
+    /// and a quoted source line starts with an escape sequence rather than its number.
+    #[test]
+    fn ran_out_of_disk_does_not_match_a_colored_quoted_source_line() {
+        assert!(!ran_out_of_disk(
+            "\x1b[1m\x1b[94m12\x1b[0m \x1b[1m\x1b[94m|\x1b[0m         let expected = \"No space left on device\";\n"
+        ));
+        assert!(ran_out_of_disk(
+            "\x1b[1m\x1b[91merror\x1b[0m\x1b[1m: No space left on device (os error 28)\x1b[0m\n"
+        ));
     }
 
     #[test]

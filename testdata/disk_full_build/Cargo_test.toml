@@ -1,0 +1,9 @@
+[package]
+name = "cargo-mutants-testdata-disk-full-build"
+description = "A build script that fails as a full disk would when one mutant is applied"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+doctest = false

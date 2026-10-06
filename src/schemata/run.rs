@@ -25,7 +25,7 @@ use super::markers::Markers;
 use super::plan::FallbackReason;
 use super::replay::{Quoting, ReplayCommand, test_commands};
 use crate::build_dir::BuildDir;
-use crate::cargo::{build_dir_cargo_env, cargo_argv};
+use crate::cargo::{build_dir_cargo_env, cargo_argv, stop_if_disk_full};
 use crate::console::Console;
 use crate::fail_fast::{KnownTests, KnownTestsBySelection};
 use crate::interrupt::check_interrupted;
@@ -258,6 +258,9 @@ impl Runner<'_> {
     /// Run one cargo command, logging to a log named `log_name`.
     ///
     /// Returns the phase result and the full log text.
+    ///
+    /// A check or build that fails because the disk is full is an error, as in
+    /// `run_cargo`. Each step has its own log, so the whole text is this step's.
     pub(crate) fn run_step(
         &self,
         phase: Phase,
@@ -285,6 +288,9 @@ impl Runner<'_> {
         check_interrupted()?;
         let log_path = log.output_dir.join(log.log_path());
         let text = read_to_string(&log_path)?;
+        if !process_status.is_success() {
+            stop_if_disk_full(phase, &text, &log_path)?;
+        }
         Ok((
             PhaseResult {
                 phase,

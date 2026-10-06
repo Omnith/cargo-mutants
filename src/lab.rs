@@ -397,6 +397,9 @@ struct Worker<'a> {
 
 impl Worker<'_> {
     /// Run until the input queue is empty.
+    ///
+    /// On an error, empty the queue first, so that the other workers stop after the
+    /// mutant each holds, rather than testing every remaining mutant before the run fails.
     fn run_queue(
         mut self,
         work_queue: &Mutex<vec::IntoIter<Mutant>>,
@@ -411,7 +414,12 @@ impl Worker<'_> {
             };
             let _span = debug_span!("mutant", name = mutant.name(false)).entered();
             let test_packages = self.tests_for_mutant.selection(&mutant);
-            self.run_one_scenario(&Scenario::Mutant(mutant), &test_packages, timeouts)?;
+            if let Err(err) =
+                self.run_one_scenario(&Scenario::Mutant(mutant), &test_packages, timeouts)
+            {
+                *work_queue.lock().expect("Lock pending work queue") = Vec::new().into_iter();
+                return Err(err);
+            }
         }
     }
 
