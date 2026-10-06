@@ -69,13 +69,13 @@ the 20 classic mutants.
 | 1 | `remove` names both switches for a scratch build dir and is empty in place. A child does not see a removed variable, and sees the `set` value of one both removed and set | unit tests `incremental_switches_that_turn_incremental_off_are_removed_except_in_place`, `incremental_switches_that_turn_incremental_on_or_are_unset_are_kept`, `child_does_not_see_a_variable_that_remove_names`, `child_sees_the_set_value_of_a_variable_that_is_removed_and_set`, `child_inherits_a_variable_that_remove_does_not_name` | pass |
 | 2 | Seeding and `copy_target` skip an `incremental` directory beside `.fingerprint`, and copy one without it | `copy_target_dir_skips_incremental_caches_beside_fingerprints`, `copy_tree_with_copy_target_skips_incremental_caches_beside_fingerprints` | pass |
 | 3 | Classic and schemata builds carry `-C incremental=` with both switches exported. `removed_env` names both. A profile switch keeps incremental off | `incremental_switches_from_environment_are_not_inherited_by_build_dirs`, `incremental_switches_from_environment_are_not_inherited_by_schemata_build`, `incremental_off_in_the_profile_is_honoured_by_build_dirs`, `coverage_build_is_not_incremental_in_test_selection_coverage_tree` | pass |
-| 4 | A full disk stops the run on both paths and empties the queue. Quoted source, including a colored line and JSON `rendered` text, does not stop it | six `ran_out_of_disk_*` unit tests, `a_build_that_runs_out_of_disk_stops_the_run_in_disk_full_build_tree_with_schemata`, `..._without_schemata`, `source_holding_the_disk_full_message_does_not_stop_the_run_in_disk_full_literal_tree` | pass |
+| 4 | A full disk stops the run on both paths and empties the queue. Quoted source, including a colored line and JSON `rendered` text, does not stop it | nine `ran_out_of_disk_*` unit tests, eight of which compile on unix and one on Windows, with `quotes_source_only_on_rustc_gutter_lines` and `stop_if_disk_full_reads_only_a_failed_check_or_build`. `a_build_that_runs_out_of_disk_stops_the_run_in_disk_full_build_tree_with_schemata`, `..._without_schemata`, `source_holding_the_disk_full_message_does_not_stop_the_run_in_disk_full_literal_tree` | pass |
 | 5a | Every mutant's outcome is identical across all five runs | the five sorted `name<TAB>summary` lists have one SHA-1, and `diff` of A1 against each other run prints nothing | pass |
 | 5b | Each run tests at least 20 fallback mutants the classic way | 20 in each run, from the `jq` count above | pass |
 | 5c | In B1, B2 and C every classic log has `-C incremental=` on the `backend_core` rustc line. In A1 and A2 none has | B1 20 of 20 logs (68 of 68 `--crate-name backend_core` rustc lines), B2 20 of 20 (69 of 69), C 20 of 20 (68 of 68). A1 0 of 20 (0 of 86 lines), A2 0 of 20 (0 of 92). No A log anywhere in `log/` holds `-C incremental=` | pass |
 | 5d | `removed_env` is `{"CARGO_INCREMENTAL": "0"}` in B1 and B2, and `{}` in C | the `jq` line above. B1's console printed the removal line once. C's printed none. A1 and A2 have no such key | pass |
 | 5e | B1 + B2 `fallback_wall_seconds` is at most 0.75 of A1 + A2 | 289.8 s against 636.5 s, a ratio of 0.455. Per pair: B1/A1 0.48, B2/A2 0.43. No rerun was needed | pass |
-| 6 | `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings` and the suite pass | at `0398944`: `cargo fmt --check` exit 0, clippy clean, `cargo nextest run --all-features` gave `664 tests run: 664 passed (2 slow), 3 skipped` | pass |
+| 6 | `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings` and the suite pass | at `f4e32dd`, after the review folds: `cargo fmt` clean, clippy clean, `cargo nextest run --all-features` gave `668 tests run: 668 passed, 3 skipped` under `env -u CARGO_INCREMENTAL` and under `CARGO_INCREMENTAL=0` | pass |
 | 7 | `NEWS.md` and the book state the removal, what is honoured, the cost, the opt-outs, the CI note, the seeding rule and the disk-full stop | `NEWS.md` `## Unreleased` Changed and Fixed bullets. `book/src/build-dirs.md` `## Incremental compilation` and the seeding section. `book/src/schemata.md` names `removed_env` | pass |
 
 The 5c count of `--crate-name backend_core` lines differs between runs of the same mutants. A
@@ -95,3 +95,41 @@ Batches A to C folded each finding into the plan or the design before the next b
 | `disk_full_literal` has two unviable mutants, not one: `+` mutates to `-` and to `*`, and neither compiles on a `String`. Both paths gave `4 mutants tested: 2 caught, 2 unviable` | plan Task 5, the tree's description and test | `91426b9`, `2558cc8` |
 | A colored quoted source line starts with an escape sequence, not its line number, so it counted as a full disk under `CARGO_TERM_COLOR=always`. A plain line now loses its ANSI sequences first. Ninth detector test added | design Measured 14 and Approach, plan Task 5 Step 6 | `e808677`, `2558cc8` |
 | The plan's Changed text said a scratch build dir drops both switches. The shipped `NEWS.md` and book say it drops a switch only when its value turns incremental off, and keeps `CARGO_INCREMENTAL=1` and `CARGO_BUILD_INCREMENTAL=true`. That is the rule `incremental_switches_to_remove` in `src/cargo.rs` applies | `NEWS.md`, `book/src/build-dirs.md` | `0398944` |
+
+## Review findings
+
+The code review of pull request 1, folded on 2026-10-05. Each fold that adds a guard was first
+watched to fail, by a new test or by a hand probe that was then reversed from a saved copy.
+
+| Finding | Severity | What changed | Commit |
+|---|---|---|---|
+| **The linker rule was never applied to JSON.** With `--message-format=json`, rustc puts `ld: ... errno=28` in a child `message`, and only plain lines checked for it. A full disk at link time made every embedded mutant fall back as an unattributed compile error | MEDIUM (M1) | One per-line predicate, `says_disk_full`, for plain lines and for each line of every JSON `message` field. New test `ran_out_of_disk_matches_the_linker_in_a_json_compiler_message` | `297d592` |
+| **An inherited `CARGO_TARGET_DIR` hid a mutant.** `incremental_switches_from_environment_are_not_inherited_by_schemata_build` missed `&&` to `\|\|` in `report_env_overrides` whenever the test process had `CARGO_TARGET_DIR`, as it does when cargo-mutants tests itself | MEDIUM (M2) | `run()` in `tests/integration_util/mod.rs` strips `CARGO_TARGET_DIR` and `CARGO_BUILD_TARGET_DIR`. With the mutation applied and `CARGO_TARGET_DIR` exported, the test passed before and fails after | `79571f3` |
+| **Nothing guarded the log offset in `run_cargo`.** The log holds the mutation's diff, unquoted, before the build's output | MEDIUM (M3) | `testdata/disk_full_literal` puts the literal within three lines of the unviable `+` mutation. A probe that reads the log from its start now fails the `--no-schemata` run. It passed on the old tree | `c425ddd` |
+| **Every platform's markers counted on every platform.** Linux's `(os error 112)` is `EHOSTDOWN` | LOW (L1) | The `DISK_FULL` const holds only the running platform's entries. On unix, `Host is down (os error 112)` does not match. Windows-only inputs are under `#[cfg(windows)]`. `testdata/disk_full_build/build.rs` prints the platform's own message | `297d592` |
+| **No input carried an error code without its text** | LOW (L3) | One input per marker, alone, under the platform's `cfg` | `297d592` |
+| **Two missed mutants.** `&&` to `\|\|` in `plain_line_ran_out_of_disk`, and the boundaries of `quotes_source` | missed mutants, from the review | A linker failure without `errno=28` must not match. `quotes_source_only_on_rustc_gutter_lines` asserts that `4\| x` and `4 -> x` are not quoted. Hand probes of each mutation fail the new asserts | `297d592` |
+| **A failed workspace copy left the queue full.** `BuildDir::copy_from(...)?` returned before `run_queue` | LOW (L4) | The thread closure in `run_mutants` empties the queue on any error. `run_queue` no longer does | `498760e` |
+| **The phase guard sat in two places**, which made `run_cargo`'s copy an equivalent mutant. `schemata::test_mutants` recomputed the overrides `main` had computed | LOW (L6) | `stop_if_disk_full` takes the phase, the exit status and a reader of the output, and calls the reader only for a failed check or build. New test `stop_if_disk_full_reads_only_a_failed_check_or_build`. `main` passes `removed` to `schemata::test_mutants` | `f4e32dd` |
+| **`NEWS.md` overclaimed.** It said source holding the message never triggers the stop. A user's own text inside a diagnostic, such as a `#[deprecated(note = "...")]` message or a `const` panic message, can | LOW (L2) | `NEWS.md` names only source lines that rustc quotes. The book made no such claim. The detector is unchanged | `575fafd` |
+| **The stop's exit code was not stated** | LOW (L5) | The design's Approach says it exits 1, as every internal error does, and why | `575fafd` |
+
+Not folded, by the orchestrator's decision: filling `<NAME>` in the console line, and `env::var`
+against `env::var_os` in the report.
+
+The L4 move is covered by the existing `-j2` test. A probe that skipped the moved drain made
+`a_build_that_runs_out_of_disk_stops_the_run_in_disk_full_build_tree_without_schemata` fail with
+22 mutants started.
+
+Mutation testing of the folds, with the fork's debug build at `f4e32dd`:
+
+| Invocation | Tested | Caught | Missed | Unviable |
+|---|---|---|---|---|
+| `--in-diff` over `git diff 48064aa f4e32dd -- src`, `--no-schemata -j2 -- --bins --test main -- out_of_disk disk_full incremental cargo_target_dir` | 27 | 21 | 1 | 5 |
+| `-f src/cargo.rs --re quotes_source --no-schemata -j2 -- --bins -- quotes_source` | 6 | 6 | 0 | 0 |
+
+The five unviable mutants replace `main`, `run_cargo`, `schemata::test_mutants` and
+`Runner::run_step` with a `Default` value of a type that has none. The miss is
+`delete field jobs from struct Report expression in test_mutants`, on a line next to the folded
+one. It also survives the whole `--bins --test main` suite: no test reads `jobs` from
+`schemata.json`. The line dates from `56ec146` and this fold does not change it.
