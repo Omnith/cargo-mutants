@@ -4273,6 +4273,7 @@ fn schemata_outcomes_match_classic_in_factorial_tree_with_cargo_test_exec() {
 #[test]
 fn schemata_outcomes_match_classic_in_well_tested_tree_with_parallel_jobs() {
     let report = assert_schemata_outcomes_match_classic("well_tested", &["-j", "4"], &[]);
+    assert_eq!(report["jobs"], 4);
     assert_eq!(report["test_exec"], "direct");
     // --jobs is used as given, without measuring.
     assert_eq!(report["test_jobs"], 4);
