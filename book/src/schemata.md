@@ -506,6 +506,10 @@ in those files), `baseline_processes` (the number of test processes that recorde
 running the tree's code with no mutant selected), and `ran_in_baseline_mutants`
 (the number of embedded mutants whose code ran then).
 
+`removed_env` records each variable that the build directories removed from
+cargo-mutants' environment, with the value it had, such as `CARGO_INCREMENTAL`.
+See [Incremental compilation](build-dirs.md#incremental-compilation).
+
 If the tests failed with the schema and files that tests might read were left out
 of it, `baseline_retry` records the `files` and `packages` left out, the number of
 `mutants` that fell back, the cost (`failed_baseline_seconds`, `build_passes`,

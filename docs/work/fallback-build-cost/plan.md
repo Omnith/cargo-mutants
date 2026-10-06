@@ -1242,11 +1242,11 @@ git commit -m 'Stop the run when a build fails because the disk is full' -- src/
 
 **Files:** modify `NEWS.md`, `book/src/build-dirs.md`, `Cargo.toml` `:3`, `Cargo.lock`.
 
-- [ ] **Step 1: version.** `Cargo.toml` `version = "27.1.0+omnith.2"`. Run `cargo build` so
+- [x] **Step 1: version.** `Cargo.toml` `version = "27.1.0+omnith.2"`. Run `cargo build` so
   `Cargo.lock` follows. In `NEWS.md`, change the first Unreleased bullet's `27.1.0+omnith.1` to
   `27.1.0+omnith.2`.
 
-- [ ] **Step 2: `NEWS.md`.** Add two bullets under `## Unreleased`, after the version bullet, in
+- [x] **Step 2: `NEWS.md`.** Add two bullets under `## Unreleased`, after the version bullet, in
   the file's style: one paragraph each, `Changed:` and `Fixed:`.
   - **Changed:** cargo commands in a scratch build dir no longer see `CARGO_INCREMENTAL` or
     `CARGO_BUILD_INCREMENTAL` from the environment, so a mutant tested on its own builds
@@ -1264,7 +1264,7 @@ git commit -m 'Stop the run when a build fails because the disk is full' -- src/
     unviable, so a full disk could hide a missed mutant. Source that holds the same message as
     text does not trigger it.
 
-- [ ] **Step 3: `book/src/build-dirs.md`.** Under `## Target directories`, add a section
+- [x] **Step 3: `book/src/build-dirs.md`.** Under `## Target directories`, add a section
   `## Incremental compilation` with the same facts as the Changed bullet, and the reason: each
   build dir rebuilds the mutated package once per mutant, and a switch set for a whole shell
   makes each of those builds start from nothing. In `## Seeding build directories from the
@@ -1272,7 +1272,7 @@ git commit -m 'Stop the run when a build fails because the disk is full' -- src/
   dir cannot reuse. In `book/src/schemata.md`, where it lists the keys of `schemata.json`
   (near `:500-506`), add one sentence naming `removed_env`.
 
-- [ ] **Step 4: the whole gate.** `df -h ~/repos` first.
+- [x] **Step 4: the whole gate.** `df -h ~/repos` first.
 
 ```
 cargo fmt --check
@@ -1282,7 +1282,7 @@ cargo nextest run --all-features
 
 Expected: fmt clean, clippy clean, every test passes. Quote the counts.
 
-- [ ] **Step 5: commit.**
+- [x] **Step 5: commit.**
 
 ```
 git commit -m 'Describe incremental scratch builds and the disk-full stop' -- NEWS.md book/src/build-dirs.md book/src/schemata.md Cargo.toml Cargo.lock

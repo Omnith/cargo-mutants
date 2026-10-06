@@ -1,6 +1,6 @@
 [package]
 name = "cargo-mutants"
-version = "27.1.0+omnith.1"
+version = "27.1.0+omnith.2"
 edition = "2024"
 authors = ["Martin Pool"]
 license = "MIT"
