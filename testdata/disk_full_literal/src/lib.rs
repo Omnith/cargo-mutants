@@ -1,4 +1,7 @@
 pub fn greeting(name: &str) -> String {
+    // within the diff's three lines of context, so a mutant's log holds this line,
+    // unquoted, before the build's output
+    let _message = "No space left on device";
     // `+` to `-` doesn't compile, so the schema's check fails and quotes source.
     name.to_owned() + "!"
 }

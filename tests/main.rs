@@ -5934,7 +5934,8 @@ fn a_build_that_runs_out_of_disk_stops_the_run_in_disk_full_build_tree_with_sche
 }
 
 /// Source that holds a full disk's message as text is quoted in compile errors and
-/// warnings. That's not the disk, so the run goes on.
+/// warnings. That's not the disk, so the run goes on. A mutant's log also holds the text
+/// unquoted, in the diff written before the build, so only the build's own output is read.
 #[test]
 fn source_holding_the_disk_full_message_does_not_stop_the_run_in_disk_full_literal_tree() {
     for schemata in ["--no-schemata", "--schemata"] {
