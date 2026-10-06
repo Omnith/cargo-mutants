@@ -120,7 +120,7 @@ than fixing it.
 `run_cargo`, `src/schemata/run.rs` (`run_step`, `run_test_command`, the `cargo test` path near
 `:999`), `src/schemata/coverage/collect.rs` (`:405` through `run_step`, `:512` directly).
 
-- [ ] **Step 1: write the failing tests** at the end of `src/process.rs`, beside `mod test`.
+- [x] **Step 1: write the failing tests** at the end of `src/process.rs`, beside `mod test`.
 
 ```rust
 #[cfg(all(test, unix))]
@@ -197,7 +197,7 @@ mod env_test {
 The first test is the presence half. Without it, the second passes on a child that sees nothing
 at all.
 
-- [ ] **Step 2: run them and watch them fail to compile on the missing `Env`.**
+- [x] **Step 2: run them and watch them fail to compile on the missing `Env`.**
 
 ```
 cargo nextest run --all-features -E 'test(/env_test::/)'
@@ -205,7 +205,7 @@ cargo nextest run --all-features -E 'test(/env_test::/)'
 
 Expected: error `cannot find type Env`, or `unresolved import super::Env`.
 
-- [ ] **Step 3: add `Env` to `src/process.rs`**, above `pub struct Process`.
+- [x] **Step 3: add `Env` to `src/process.rs`**, above `pub struct Process`.
 
 ```rust
 /// Environment changes for a child process, relative to cargo-mutants' own environment.
@@ -225,7 +225,7 @@ INTENT: `Process::run` and `Process::start` take `env: &Env` in place of
 `env: &[(String, String)]`. In `start`, call `command.env_remove(name)` for each `remove` entry,
 then `command.envs(...)` over `set`, before `stdin`. Keep the debug span unchanged.
 
-- [ ] **Step 4: change every caller to build an `Env`**, with `set` holding what it passed before
+- [x] **Step 4: change every caller to build an `Env`**, with `set` holding what it passed before
   and `remove` empty. Behaviour is unchanged in this task. Callers:
   - `run_cargo` passes `&Env { set: build_dir_cargo_env(...), remove: Vec::new() }` for now.
   - `Runner::cargo_env` and `Runner::test_env` keep returning `Vec<(String, String)>` for now.
@@ -234,7 +234,7 @@ then `command.envs(...)` over `set`, before `stdin`. Keep the debug span unchang
     way.
   - `collect.rs` `:512` wraps its `env`.
 
-- [ ] **Step 5: run the three tests and watch them pass.**
+- [x] **Step 5: run the three tests and watch them pass.**
 
 ```
 cargo nextest run --all-features -E 'test(/env_test::/)'
@@ -242,7 +242,7 @@ cargo nextest run --all-features -E 'test(/env_test::/)'
 
 Expected: 3 passed.
 
-- [ ] **Step 6: commit.**
+- [x] **Step 6: commit.**
 
 ```
 cargo fmt && cargo clippy --all-targets --all-features -- -D warnings
@@ -258,7 +258,7 @@ git commit -m 'Let a child process have inherited variables removed' -- src/proc
 `run_test_command` `:669`), `src/schemata/coverage/collect.rs` (`:391-404`, `:501-505`),
 `tests/main.rs`.
 
-- [ ] **Step 1: write the failing unit tests** in `src/cargo.rs`'s `mod test`, beside
+- [x] **Step 1: write the failing unit tests** in `src/cargo.rs`'s `mod test`, beside
   `build_dir_cargo_env_sets_cargo_target_dir_to_own_target_except_in_place`.
 
 ```rust
@@ -306,7 +306,7 @@ fn incremental_switches_that_turn_incremental_on_or_are_unset_are_kept() {
 The existing test reads the set half: change its `.into_iter()` to `.set.into_iter()`. It
 asserts the same values as before.
 
-- [ ] **Step 2: write the failing integration tests** in `tests/main.rs`, after
+- [x] **Step 2: write the failing integration tests** in `tests/main.rs`, after
   `cargo_target_dir_from_environment_is_not_used_by_schemata_build`.
 
 ```rust
@@ -464,13 +464,15 @@ fn coverage_build_is_not_incremental_in_test_selection_coverage_tree() {
 }
 ```
 
-- [ ] **Step 3: watch them fail.**
+- [x] **Step 3: watch them fail.**
 
 ```
 cargo nextest run --all-features -E 'test(/incremental_switches_that_turn/) | test(/incremental_switches_from_environment/) | test(/incremental_off_in_the_profile/) | test(/coverage_build_is_not_incremental/)'
 ```
 
-Expected: 6 run.
+Expected: none run. This said "6 run", which was wrong: a unit test that does not compile stops
+the whole build, so nextest runs nothing. Run the same filter with `--test main` added to see the
+four integration tests' RED while the unit tests do not compile.
 - The unit tests fail to compile on the missing `incremental_switches_to_remove`. Record the
   error.
 - `incremental_switches_..._build_dirs` and `..._schemata_build` fail on the `-C incremental=`
@@ -482,7 +484,7 @@ Expected: 6 run.
   llvm-tools is missing it prints `SKIPPED` and proves nothing. Install them with
   `rustup component add llvm-tools` before you run it.
 
-- [ ] **Step 4: implement.**
+- [x] **Step 4: implement.**
 
 In `src/cargo.rs`, beside `build_dir_cargo_env`:
 
@@ -546,10 +548,10 @@ and with `("CARGO_INCREMENTAL", "0")`. Add one comment line above it:
 
 `:501`: extend `env.set` as today.
 
-- [ ] **Step 5: watch them pass.** Same command as Step 3. Expected: 6 passed, or 5 and one
+- [x] **Step 5: watch them pass.** Same command as Step 3. Expected: 6 passed, or 5 and one
   `SKIPPED` only if llvm-tools cannot be installed. Report that case.
 
-- [ ] **Step 6: commit.**
+- [x] **Step 6: commit.**
 
 ```
 cargo fmt && cargo clippy --all-targets --all-features -- -D warnings
@@ -563,7 +565,7 @@ git commit -m 'Remove inherited incremental switches in scratch build dirs' -- s
 **Files:** modify `src/copy_tree.rs` (`copy_target_dir` `:148`, `copy_tree`'s `filter_entry`
 `:237-248`, `mod test`).
 
-- [ ] **Step 1: write the failing tests** in `src/copy_tree.rs`'s `mod test`, after
+- [x] **Step 1: write the failing tests** in `src/copy_tree.rs`'s `mod test`, after
   `copy_target_dir_copies_nested_and_hidden_files_preserving_mtime`.
 
 ```rust
@@ -626,7 +628,7 @@ fn copy_tree_with_copy_target_skips_incremental_caches_beside_fingerprints() -> 
 }
 ```
 
-- [ ] **Step 2: watch them fail.**
+- [x] **Step 2: watch them fail.**
 
 ```
 cargo nextest run --all-features -E 'test(/skips_incremental_caches_beside_fingerprints/)'
@@ -634,7 +636,7 @@ cargo nextest run --all-features -E 'test(/skips_incremental_caches_beside_finge
 
 Expected: 2 run, 2 fail on the `!...incremental...exists()` assertion.
 
-- [ ] **Step 3: implement.** In `src/copy_tree.rs`, above `copy_target_dir`:
+- [x] **Step 3: implement.** In `src/copy_tree.rs`, above `copy_target_dir`:
 
 ```rust
 /// True if `path` is cargo's incremental compilation cache for one profile: a directory
@@ -651,7 +653,7 @@ stat `parent/.fingerprint`, so the walk does no extra stat for other entries. In
 which this is true. In `copy_tree`, add `&& !is_incremental_cache(entry.path())` to the existing
 `filter_entry`, gated on the entry being a directory.
 
-- [ ] **Step 4: watch them pass.** Same command. Expected: 2 passed. Then run the module's other
+- [x] **Step 4: watch them pass.** Same command. Expected: 2 passed. Then run the module's other
   tests:
 
 ```
@@ -660,14 +662,14 @@ cargo nextest run --all-features -E 'test(/copy_tree::/)'
 
 Expected: every test passes. Quote the count.
 
-- [ ] **Step 5: commit.**
+- [x] **Step 5: commit.**
 
 ```
 cargo fmt && cargo clippy --all-targets --all-features -- -D warnings
 git commit -m 'Skip incremental caches when seeding a build dir' -- src/copy_tree.rs
 ```
 
-- [ ] **Batch A end:** `df -h ~/repos`, then the whole suite with
+- [x] **Batch A end:** `df -h ~/repos`, then the whole suite with
   `cargo nextest run --all-features`. Report pass, fail and skip counts. Report the RED line of
   each new test.
 
@@ -678,7 +680,7 @@ git commit -m 'Skip incremental caches when seeding a build dir' -- src/copy_tre
 **Files:** modify `src/cargo.rs`, `src/main.rs` (`:690`, after `console.set_debug_log`),
 `src/schemata/mod.rs` (`Report` `:292`, its construction `:716`), `tests/main.rs`.
 
-- [ ] **Step 1: write the failing unit tests** in `src/cargo.rs`'s `mod test`.
+- [x] **Step 1: write the failing unit tests** in `src/cargo.rs`'s `mod test`.
 
 ```rust
 #[test]
@@ -717,7 +719,7 @@ fn env_overrides_is_empty_in_place_or_when_nothing_is_set() {
 
 Add `use std::collections::BTreeMap;` to the test module if it is not there.
 
-- [ ] **Step 2: extend the schemata integration test** from Task 2,
+- [x] **Step 2: extend the schemata integration test** from Task 2,
   `incremental_switches_from_environment_are_not_inherited_by_schemata_build`. Keep the assert
   chain's output, and add after the existing assertions:
 
@@ -742,7 +744,7 @@ Change the test's `.assert().success();` to capture the output, and add:
 
 where `let assert = run()...timeout(OUTER_TIMEOUT).assert().success();`.
 
-- [ ] **Step 3: keep the other integration tests hermetic.** The new console line goes to
+- [x] **Step 3: keep the other integration tests hermetic.** The new console line goes to
   stderr whenever `CARGO_INCREMENTAL` or `CARGO_BUILD_INCREMENTAL` is set. Eight existing tests
   assert an empty or exact stderr, and the fork's CI sets `CARGO_INCREMENTAL: 0`
   (`.github/workflows/tests.yml:39`). The plan's review demonstrated the 8 failures. In
@@ -755,16 +757,17 @@ where `let assert = run()...timeout(OUTER_TIMEOUT).assert().success();`.
     // them explicitly.
 ```
 
-- [ ] **Step 4: watch the new tests fail.**
+- [x] **Step 4: watch the new tests fail.**
 
 ```
 cargo nextest run --all-features -E 'test(/env_overrides_/) | test(/incremental_switches_from_environment_are_not_inherited_by_schemata_build/)'
 ```
 
-Expected: 3 run. The unit tests fail to compile on `env_overrides`. The integration test fails on
-`removed_env` being `null`.
+Expected: none run, because the unit tests fail to compile on `env_overrides`. This said "3 run",
+which was wrong for the reason Task 2 Step 3 gives. Add `--test main` to the same filter to see the
+integration test fail on `removed_env` being `null`.
 
-- [ ] **Step 5: implement** in `src/cargo.rs`, beside `INCREMENTAL_SWITCHES`:
+- [x] **Step 5: implement** in `src/cargo.rs`, beside `INCREMENTAL_SWITCHES`:
 
 ```rust
 /// Variables that a scratch build dir overrides with its own value.
@@ -823,9 +826,9 @@ In `src/schemata/mod.rs`, add to `Report`:
 and set it at construction from
 `env_overrides(options, |name| env::var(name).ok()).removed`.
 
-- [ ] **Step 6: watch them pass.** Same command. Expected: 3 passed.
+- [x] **Step 6: watch them pass.** Same command. Expected: 3 passed.
 
-- [ ] **Step 7: commit.**
+- [x] **Step 7: commit.**
 
 ```
 cargo fmt && cargo clippy --all-targets --all-features -- -D warnings
@@ -841,7 +844,7 @@ git commit -m 'Report the build dirs environment overrides once per run' -- src/
 `testdata/disk_full_build/{Cargo_test.toml,build.rs,src/lib.rs}` and
 `testdata/disk_full_literal/{Cargo_test.toml,src/lib.rs}`.
 
-- [ ] **Step 1: write the failing unit tests** in `src/cargo.rs`'s `mod test`. The messages are
+- [x] **Step 1: write the failing unit tests** in `src/cargo.rs`'s `mod test`. The messages are
   the ones Measured 13 captured, plus Windows' `ERROR_DISK_FULL` text.
 
 ```rust
@@ -932,7 +935,7 @@ fn ran_out_of_disk_reads_only_the_messages_of_a_json_compiler_message() {
 Add `use indoc::indoc;` and `use serde_json::json;` to the test module if they are not there.
 Both crates are already dependencies.
 
-- [ ] **Step 2: create the testdata tree.**
+- [x] **Step 2: create the testdata tree.**
 
 `testdata/disk_full_build/Cargo_test.toml`:
 
@@ -962,13 +965,22 @@ use std::process::exit;
 
 fn main() {
     println!("cargo:rerun-if-changed=src/lib.rs");
-    let source = read_to_string("src/lib.rs").expect("read src/lib.rs");
+    // the classic way writes `x + /* ~ changed by cargo-mutants ~ */ 2`, and the schema
+    // writes `x + 2`
+    let source = read_to_string("src/lib.rs")
+        .expect("read src/lib.rs")
+        .replace("/* ~ changed by cargo-mutants ~ */ ", "");
     if source.contains("x + 2") {
         eprintln!("error: No space left on device (os error 28)");
         exit(1);
     }
 }
 ```
+
+This script matched `x + 2` on the raw source until 2026-10-05, which was wrong. The classic way
+writes the mutant with `MUTATION_MARKER_COMMENT` after the operator (`src/main.rs`), so the
+trigger never fired without schemata. Measured: `22 mutants tested: 2 missed, 20 caught`, and the
+trigger mutant was caught by `double_three_is_six`.
 
 `testdata/disk_full_build/src/lib.rs`:
 
@@ -1031,7 +1043,7 @@ mod test {
 ```toml
 [package]
 name = "cargo-mutants-testdata-disk-full-literal"
-description = "Source that holds a full disk's message as text, and one unviable mutant"
+description = "Source that holds a full disk's message as text, and two unviable mutants"
 version = "0.0.0"
 edition = "2021"
 publish = false
@@ -1066,7 +1078,7 @@ record the count, and the trigger's position in `--no-shuffle` order. The `-j2` 
 `1..=4` assumes the trigger is among the first three. If it is later, set the upper bound to its
 position plus one, and say so in the report.
 
-- [ ] **Step 3: write the failing integration test** in `tests/main.rs`.
+- [x] **Step 3: write the failing integration test** in `tests/main.rs`.
 
 ```rust
 /// A build that fails because the disk is full stops the run with an error, rather than
@@ -1125,21 +1137,28 @@ fn source_holding_the_disk_full_message_does_not_stop_the_run_in_disk_full_liter
             .assert()
             .success();
         let unviable = read_to_string(out.path().join("mutants.out/unviable.txt")).unwrap();
-        assert_eq!(unviable.lines().count(), 1, "{schemata}: {unviable}");
+        assert_eq!(unviable.lines().count(), 2, "{schemata}: {unviable}");
     }
 }
 ```
 
-- [ ] **Step 4: watch them fail.**
+The count said 1 until 2026-10-05, which was wrong. `+` mutates to `-` and to `*`, and neither
+compiles on a `String`. Measured on both paths: `4 mutants tested: 2 caught, 2 unviable`.
+
+- [x] **Step 4: watch them fail.**
 
 ```
-cargo nextest run --all-features -E 'test(/ran_out_of_disk_/) | test(/runs_out_of_disk_stops_the_run/)'
+cargo nextest run --all-features -E 'test(/ran_out_of_disk_/) | test(/runs_out_of_disk_stops_the_run/) | test(/disk_full_literal_tree/)'
 ```
 
-Expected: 8 run. The unit tests fail to compile on `ran_out_of_disk`. Comment them out for a
-moment to see the integration tests' RED on their own, then restore them:
-- `..._without_schemata` fails at `.failure()`: today the run exits 0 and records the trigger
-  mutant unviable.
+Expected: none run, because the unit tests fail to compile on `ran_out_of_disk`. Add
+`--test main` to the same filter to see the 3 integration tests' RED on their own. This said "8
+run" and "comment them out", which was wrong for the reason Task 2 Step 3 gives. The filter also
+lacked `test(/disk_full_literal_tree/)` until 2026-10-05, so it selected 7 tests, not 8.
+- `..._without_schemata` fails on `the disk is full`: today it records the trigger mutant
+  unviable. It passes `.failure()` today, because two `>` to `>=` mutants in the tree are
+  equivalent and missed, so the run exits 2. This said it failed at `.failure()`, which was
+  wrong.
 - `..._with_schemata` fails on `the disk is full`: today it already stops, with
   `cargo build of the schema failed (Failure(101)) without reporting compile errors`
   (`src/schemata/run.rs:359-363`), or it records the trigger mutant unviable. The new check
@@ -1152,7 +1171,7 @@ After the detector exists, the `-j2` half of `..._without_schemata` still fails 
 started count until `run_queue` empties the queue. Watch that failure before Step 5's queue
 change.
 
-- [ ] **Step 5: implement** in `src/cargo.rs`:
+- [x] **Step 5: implement** in `src/cargo.rs`:
 
 ```rust
 /// True if `text`, written by a failed cargo command, says the disk was full.
@@ -1203,9 +1222,9 @@ In `Runner::run_step`: after reading `text`, when `phase` is `Check` or `Build`,
 not success, and `ran_out_of_disk(&text)`, `bail!` the same way. Each step has its own log, so the
 whole text is this step's.
 
-- [ ] **Step 6: watch them pass.** Same command. Expected: 8 passed.
+- [x] **Step 6: watch them pass.** Same command. Expected: 9 passed. Execution added a ninth, `ran_out_of_disk_does_not_match_a_colored_quoted_source_line`, with the escape-stripping step in `plain_line_ran_out_of_disk` (design, Measured 14).
 
-- [ ] **Step 7: commit.**
+- [x] **Step 7: commit.**
 
 ```
 cargo fmt && cargo clippy --all-targets --all-features -- -D warnings
@@ -1213,7 +1232,7 @@ git add testdata/disk_full_build testdata/disk_full_literal
 git commit -m 'Stop the run when a build fails because the disk is full' -- src/cargo.rs src/schemata/run.rs src/lab.rs tests/main.rs testdata/disk_full_build testdata/disk_full_literal
 ```
 
-- [ ] **Batch B end:** `df -h ~/repos`, then the whole suite twice: once as your shell is, and
+- [x] **Batch B end:** `df -h ~/repos`, then the whole suite twice: once as your shell is, and
   once with `CARGO_INCREMENTAL=0` exported, as the fork's CI runs it. Report counts for both and
   each RED line.
 
@@ -1223,11 +1242,11 @@ git commit -m 'Stop the run when a build fails because the disk is full' -- src/
 
 **Files:** modify `NEWS.md`, `book/src/build-dirs.md`, `Cargo.toml` `:3`, `Cargo.lock`.
 
-- [ ] **Step 1: version.** `Cargo.toml` `version = "27.1.0+omnith.2"`. Run `cargo build` so
+- [x] **Step 1: version.** `Cargo.toml` `version = "27.1.0+omnith.2"`. Run `cargo build` so
   `Cargo.lock` follows. In `NEWS.md`, change the first Unreleased bullet's `27.1.0+omnith.1` to
   `27.1.0+omnith.2`.
 
-- [ ] **Step 2: `NEWS.md`.** Add two bullets under `## Unreleased`, after the version bullet, in
+- [x] **Step 2: `NEWS.md`.** Add two bullets under `## Unreleased`, after the version bullet, in
   the file's style: one paragraph each, `Changed:` and `Fixed:`.
   - **Changed:** cargo commands in a scratch build dir no longer see `CARGO_INCREMENTAL` or
     `CARGO_BUILD_INCREMENTAL` from the environment, so a mutant tested on its own builds
@@ -1245,7 +1264,7 @@ git commit -m 'Stop the run when a build fails because the disk is full' -- src/
     unviable, so a full disk could hide a missed mutant. Source that holds the same message as
     text does not trigger it.
 
-- [ ] **Step 3: `book/src/build-dirs.md`.** Under `## Target directories`, add a section
+- [x] **Step 3: `book/src/build-dirs.md`.** Under `## Target directories`, add a section
   `## Incremental compilation` with the same facts as the Changed bullet, and the reason: each
   build dir rebuilds the mutated package once per mutant, and a switch set for a whole shell
   makes each of those builds start from nothing. In `## Seeding build directories from the
@@ -1253,7 +1272,7 @@ git commit -m 'Stop the run when a build fails because the disk is full' -- src/
   dir cannot reuse. In `book/src/schemata.md`, where it lists the keys of `schemata.json`
   (near `:500-506`), add one sentence naming `removed_env`.
 
-- [ ] **Step 4: the whole gate.** `df -h ~/repos` first.
+- [x] **Step 4: the whole gate.** `df -h ~/repos` first.
 
 ```
 cargo fmt --check
@@ -1263,7 +1282,7 @@ cargo nextest run --all-features
 
 Expected: fmt clean, clippy clean, every test passes. Quote the counts.
 
-- [ ] **Step 5: commit.**
+- [x] **Step 5: commit.**
 
 ```
 git commit -m 'Describe incremental scratch builds and the disk-full stop' -- NEWS.md book/src/build-dirs.md book/src/schemata.md Cargo.toml Cargo.lock
@@ -1275,7 +1294,7 @@ git commit -m 'Describe incremental scratch builds and the disk-full stop' -- NE
 
 This is design Acceptance criterion 5. It needs Docker, and about 12 GiB free at the start.
 
-- [ ] **Step 1: disk and setup.** `df -h ~/repos`. Stop if under 12 GiB.
+- [x] **Step 1: disk and setup.** `df -h ~/repos`. Stop if under 12 GiB.
 
 ```
 git -C ~/repos/cargo-mutants worktree add <scratch>/fork-old 2f837e8
@@ -1289,7 +1308,7 @@ git -C ~/repos/om-jastusa/remote-build-platform-v2 worktree add --detach <scratc
 `cargo install`: other sessions run the installed `cargo mutants` and must not see a new
 binary mid-run. Invoke each binary by path, as `<binary> mutants ...`.
 
-- [ ] **Step 2: Postgres and MinIO** for the jast worktree, on ports no other session uses.
+- [x] **Step 2: Postgres and MinIO** for the jast worktree, on ports no other session uses.
   Other sessions hold 5432, 9000, 55434 and 59002. First check that the two ports are free:
   `lsof -i :55436 -i :59006` prints nothing. Then:
 
@@ -1298,7 +1317,7 @@ cd <scratch>/jast && JAST_DB_PORT=55436 JAST_MINIO_PORT=59006 COMPOSE_PROJECT_NA
 cd <scratch>/jast && JAST_DB_PORT=55436 JAST_MINIO_PORT=59006 COMPOSE_PROJECT_NAME=rbp-fbc just dev-minio
 ```
 
-- [ ] **Step 3: five runs, back to back**, each in the jast worktree, with its ports and its own
+- [x] **Step 3: five runs, back to back**, each in the jast worktree, with its ports and its own
   `--output`. Without the ports, the jast tests default to 5432 and 9000 and write into another
   session's Postgres and MinIO (`apps/backend-core/tests/pg.rs:53`, `tests/s3.rs:55`).
 
@@ -1324,7 +1343,7 @@ cd <scratch>/jast && JAST_DB_PORT=55436 JAST_MINIO_PORT=59006 <env> <binary> mut
 Before each run, `df -h ~/repos`. Stop and report if under 10 GiB: a full disk during an old-rev
 run would record mutants unviable without a word. Record `uptime` after each run.
 
-- [ ] **Step 4: check each criterion and record the evidence.**
+- [x] **Step 4: check each criterion and record the evidence.**
   - Outcomes identical across all five: one `name<TAB>summary` list per run from `outcomes.json`,
     then `diff`. Expected: no difference. Measured 12 had 337 mutants, 280 caught and 57 unviable.
     If one differs, rerun that mutant alone with both binaries (`--re '<exact name>'`, same
@@ -1340,7 +1359,7 @@ run would record mutants unviable without a word. Record `uptime` after each run
     both pairs with their load averages to the orchestrator, which takes it to Kane. Do not
     change the threshold.
 
-- [ ] **Step 5: tear down** what this task made, and report the free space before and after.
+- [x] **Step 5: tear down** what this task made, and report the free space before and after.
 
 ```
 cd <scratch>/jast && COMPOSE_PROJECT_NAME=rbp-fbc docker compose --profile s3 down -v
@@ -1351,7 +1370,7 @@ git -C ~/repos/cargo-mutants worktree remove --force <scratch>/fork-old
 Keep the five `out-<run>/mutants.out/schemata.json` and `outcomes.json` files. Delete the rest of
 each output directory.
 
-- [ ] **Step 6: write `docs/work/fallback-build-cost/impl.md`.** It holds what shipped, the
+- [x] **Step 6: write `docs/work/fallback-build-cost/impl.md`.** It holds what shipped, the
   table of the five runs with their load averages, and each criterion with its evidence. It has no
   narrative. Commit it:
 
@@ -1364,7 +1383,7 @@ git commit -m 'Record the fallback-build-cost acceptance runs' -- docs/work/fall
 
 ## Task 8: pull request, reviews, merge (Batch E)
 
-- [ ] **Step 1: push and open the pull request** against the fork, never upstream:
+- [x] **Step 1: push and open the pull request** against the fork, never upstream:
 
 ```
 git push -u omnith feat/fbc-1-incremental-scratch-dirs
@@ -1375,12 +1394,12 @@ The body follows jast-platform's pull request rules, which the orchestrator pass
 dispatch. One sentence on what it does, a table of what landed, a table of what was found, review
 focus as a list of paths.
 
-- [ ] **Step 2: reviews.** The orchestrator dispatches a code and architecture review and then an
+- [x] **Step 2: reviews.** The orchestrator dispatches a code and architecture review and then an
   adversarial review over the diff. Fold every CRITICAL, HIGH and MEDIUM finding on the same
   branch. Re-run the Task 6 gate after the folds.
 
-- [ ] **Step 3: merge** with `gh pr merge --repo Omnith/cargo-mutants --merge --delete-branch`.
-  Merge only when the checks that exist have all passed. Then update the main checkout:
+- [x] **Step 3: merge** with `gh pr merge --repo Omnith/cargo-mutants --merge --delete-branch`.
+  Merge only when the checks that exist have all passed. The fork had never run CI, so PR #1 had no checks. Kane chose to merge it on the local gates on 2026-10-05. Then update the main checkout:
   `git -C ~/repos/cargo-mutants pull omnith main`. Remove the worktree
   `~/repos/cargo-mutants-wt-fbc` and its target.
 

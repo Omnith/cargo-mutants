@@ -21,6 +21,12 @@ pub fn run() -> assert_cmd::Command {
     //
     // Also strip GITHUB_ACTION to avoid automatically emitting github annotations,
     // so that tests are more hermetic and reproducible between local and CI.
+    //
+    // Also strip the variables that scratch build dirs override or remove, which
+    // cargo-mutants reports once per run: CARGO_INCREMENTAL, CARGO_BUILD_INCREMENTAL,
+    // CARGO_TARGET_DIR and CARGO_BUILD_TARGET_DIR. cargo-mutants sets CARGO_TARGET_DIR
+    // when it tests itself, and an inherited one changes what the report says. Tests
+    // about them set them explicitly.
     env::vars()
         .map(|(k, _v)| k)
         .filter(|k| {
@@ -29,6 +35,10 @@ pub fn run() -> assert_cmd::Command {
                 || k == "NOCOLOR"
                 || k == "CARGO_TERM_COLOR"
                 || k == "GITHUB_ACTION"
+                || k == "CARGO_INCREMENTAL"
+                || k == "CARGO_BUILD_INCREMENTAL"
+                || k == "CARGO_TARGET_DIR"
+                || k == "CARGO_BUILD_TARGET_DIR"
         })
         .for_each(|k| {
             cmd.env_remove(k);

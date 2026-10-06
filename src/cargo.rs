@@ -5,12 +5,20 @@
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
+use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::env;
+use std::io::{Read, Seek, SeekFrom};
 use std::iter::once;
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
+use anyhow::{Context, bail};
+use camino::Utf8Path;
 use nextest_metadata::NextestExitCode;
-use tracing::{debug, debug_span, warn};
+use regex::Regex;
+use serde_json::Value;
+use tracing::{debug, debug_span, info, warn};
 
 use crate::Result;
 use crate::build_dir::BuildDir;
@@ -21,7 +29,7 @@ use crate::options::{Options, TestTool};
 use crate::outcome::{Phase, PhaseResult};
 use crate::output::ScenarioOutput;
 use crate::package::PackageSelection;
-use crate::process::{Exit, Process, TERMINATES_DESCENDANTS};
+use crate::process::{Env, Exit, Process, TERMINATES_DESCENDANTS};
 
 // Allowed nextest codes (those will be considered a mutation caught / ignored without a warning)
 const NEXTEST_ALLOWED_CODES: &[i32] = &[
@@ -33,6 +41,9 @@ const NEXTEST_ALLOWED_CODES: &[i32] = &[
 /// Run cargo build, check, or test.
 ///
 /// When testing, if any of `stop_on_failure` fail, the tests are stopped.
+///
+/// A check or build that fails because the disk is full is an error, not a result: as a
+/// result it would make the mutant unviable, and a full disk would hide a missed mutant.
 #[allow(clippy::too_many_arguments)] // I agree it's a lot but I'm not sure wrapping in a struct would be better.
 pub fn run_cargo(
     build_dir: &BuildDir,
@@ -48,10 +59,15 @@ pub fn run_cargo(
     let _span = debug_span!("run", ?phase).entered();
     let start = Instant::now();
     let argv = cargo_argv(packages, phase, options);
-    let env = build_dir_cargo_env(build_dir, options);
+    // the log holds earlier phases too: only what this phase appends is read
+    let log_start = scenario_output
+        .log_file
+        .metadata()
+        .context("read the log's length")?
+        .len();
     let process_status = Process::run(
         &argv,
-        &env,
+        &build_dir_cargo_env(build_dir, options),
         build_dir.path(),
         timeout,
         jobserver,
@@ -61,6 +77,21 @@ pub fn run_cargo(
     )?;
     check_interrupted()?;
     debug!(?process_status, elapsed = ?start.elapsed());
+    let log_path = scenario_output.output_dir.join(scenario_output.log_path());
+    stop_if_disk_full(
+        phase,
+        process_status,
+        || {
+            let mut log = scenario_output.open_log_read()?;
+            log.seek(SeekFrom::Start(log_start))
+                .context("seek to this phase's output in the log")?;
+            let mut text = Vec::new();
+            log.read_to_end(&mut text)
+                .context("read this phase's output from the log")?;
+            Ok(String::from_utf8_lossy(&text).into_owned())
+        },
+        &log_path,
+    )?;
     if let Exit::Failure(code) = process_status
         && argv[1] == "nextest"
         && !NEXTEST_ALLOWED_CODES.contains(&code)
@@ -75,6 +106,185 @@ pub fn run_cargo(
         process_status,
         argv,
     })
+}
+
+/// Stop with an error if `phase` is a check or build that failed, and its output says
+/// the disk was full. Other phases and other failures are results, not errors.
+///
+/// This is the one place that decides which phases are checked. `output` reads the
+/// phase's output, and is called only for a phase that is checked.
+pub(crate) fn stop_if_disk_full<T: AsRef<str>>(
+    phase: Phase,
+    process_status: Exit,
+    output: impl FnOnce() -> Result<T>,
+    log_path: &Utf8Path,
+) -> Result<()> {
+    if !matches!(phase, Phase::Check | Phase::Build) || process_status.is_success() {
+        return Ok(());
+    }
+    if let Some(line) = ran_out_of_disk(output()?.as_ref()) {
+        bail!("the disk is full: cargo {phase} failed; see {log_path}, which says: {line}");
+    }
+    Ok(())
+}
+
+/// What a line says when the disk is full, on the platform cargo-mutants runs on. A line
+/// says so when it holds every part of one entry.
+///
+/// Each platform has its own: an error code names a full disk on one platform only.
+/// Linux's `(os error 112)` is `EHOSTDOWN`, and Windows' `(os error 28)` is
+/// `ERROR_OUT_OF_PAPER`. A quota exceeded counts as a full disk: the build could not
+/// write, so the mutant is not unviable.
+const DISK_FULL: &[&[&str]] = if cfg!(windows) {
+    // texts from microsoft's "system error codes (0-499)". each text is localized and its
+    // code is not
+    &[
+        // `ERROR_DISK_FULL`
+        &["There is not enough space on the disk"],
+        &["(os error 112)"],
+        // `ERROR_HANDLE_DISK_FULL`
+        &["The disk is full"],
+        &["(os error 39)"],
+    ]
+} else if cfg!(target_os = "linux") {
+    &[
+        // the text and the code of `ENOSPC`
+        &["No space left on device"],
+        &["(os error 28)"],
+        &["ld:", "errno=28"],
+        // the text and the code of `EDQUOT`
+        &["Disk quota exceeded"],
+        &["(os error 122)"],
+    ]
+} else if cfg!(target_os = "macos") {
+    &[
+        // the text and the code of `ENOSPC`
+        &["No space left on device"],
+        &["(os error 28)"],
+        // the macOS linker gives only the error number
+        &["ld:", "errno=28"],
+        // the text and the code of `EDQUOT`. "disc" is apple's spelling
+        &["Disc quota exceeded"],
+        &["(os error 69)"],
+    ]
+} else if cfg!(unix) {
+    // `ENOSPC` only: other unix systems number `EDQUOT` their own way, and none was measured
+    &[
+        &["No space left on device"],
+        &["(os error 28)"],
+        &["ld:", "errno=28"],
+    ]
+} else {
+    &[]
+};
+
+/// The first line of `text`, written by a failed cargo command, that says the disk was
+/// full, trimmed. `None` if no line says so.
+///
+/// rustc, the archiver, the linker and cargo itself print the operating system's message
+/// for the error, which [`DISK_FULL`] holds for this platform. Measured by filling a disk
+/// image: `docs/work/fallback-build-cost/design.md`, Measured 13.
+pub(crate) fn ran_out_of_disk(text: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        match line
+            .starts_with('{')
+            .then(|| serde_json::from_str::<Value>(line).ok())
+            .flatten()
+        {
+            Some(value) => compiler_message_ran_out_of_disk(&value),
+            None => plain_line_ran_out_of_disk(line),
+        }
+    })
+}
+
+/// The line of a JSON compiler message's own text, or a child's, that says the disk was
+/// full. Its `rendered` text and its spans quote source, so they are never read. Any other
+/// JSON line never counts.
+///
+/// A child can hold several lines: rustc puts the linker's whole output in one.
+fn compiler_message_ran_out_of_disk(value: &Value) -> Option<String> {
+    if value["reason"] != "compiler-message" {
+        return None;
+    }
+    let diagnostic = &value["message"];
+    once(diagnostic)
+        .chain(diagnostic["children"].as_array().into_iter().flatten())
+        .filter_map(|message| message["message"].as_str())
+        .flat_map(str::lines)
+        .find(|line| says_disk_full(line))
+        .map(|line| line.trim().to_owned())
+}
+
+/// A line of plain output, without its colors, if it says the disk was full and no
+/// compiler is quoting source on it.
+fn plain_line_ran_out_of_disk(line: &str) -> Option<String> {
+    let line = without_ansi_escapes(line);
+    let text = without_build_script_prefix(&line);
+    (!quotes_source(text) && says_disk_full(text)).then(|| line.trim().to_owned())
+}
+
+/// The prefix cargo puts on a warning that a build script prints.
+static BUILD_SCRIPT_WARNING: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^warning: [A-Za-z0-9_-]+@[0-9][0-9A-Za-z.+-]*: ").expect("the pattern is valid")
+});
+
+/// `line` without the prefix cargo puts on a build script's warning,
+/// `warning: <package>@<version>: `.
+///
+/// cargo replays a build script's warnings on every later build. cc-rs forwards a C
+/// compiler's diagnostics as warnings, quoted source included, so a gutter line can follow
+/// the prefix.
+fn without_build_script_prefix(line: &str) -> &str {
+    BUILD_SCRIPT_WARNING
+        .find(line)
+        .map_or(line, |prefix| &line[prefix.end()..])
+}
+
+/// True if `line` holds every part of one entry of [`DISK_FULL`].
+fn says_disk_full(line: &str) -> bool {
+    DISK_FULL
+        .iter()
+        .any(|parts| parts.iter().all(|part| line.contains(part)))
+}
+
+/// True if rustc is quoting source on `line`: a gutter line that starts with `|`, or a
+/// numbered source or suggestion line, such as `30 |`, `4 -` or `4 +`.
+fn quotes_source(line: &str) -> bool {
+    let line = line.trim_start();
+    if line.starts_with('|') {
+        return true;
+    }
+    let after_digits = line.trim_start_matches(|c: char| c.is_ascii_digit());
+    let after_spaces = after_digits.trim_start_matches(' ');
+    if after_digits.len() == line.len() || after_spaces.len() == after_digits.len() {
+        return false;
+    }
+    let mut rest = after_spaces.chars();
+    matches!(rest.next(), Some('|' | '-' | '+' | '~')) && matches!(rest.next(), None | Some(' '))
+}
+
+/// `line` without the escape sequences that color it. Cargo colors its output when
+/// `CARGO_TERM_COLOR=always`, as CI jobs often set, and then a quoted source line starts
+/// with an escape sequence rather than its line number.
+fn without_ansi_escapes(line: &str) -> Cow<'_, str> {
+    if !line.contains('\x1b') {
+        return Cow::Borrowed(line);
+    }
+    let mut plain = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            plain.push(c);
+        } else if chars.next_if_eq(&'[').is_some() {
+            // a control sequence ends with a byte from `@` to `~`
+            for c in chars.by_ref() {
+                if ('@'..='~').contains(&c) {
+                    break;
+                }
+            }
+        }
+    }
+    Cow::Owned(plain)
 }
 
 /// Environment variables set for every cargo invocation.
@@ -93,33 +303,126 @@ pub(crate) fn cargo_env(options: &Options) -> Vec<(String, String)> {
     env
 }
 
-/// Environment variables for cargo run in `build_dir`: those of [`cargo_env`], and
-/// `CARGO_TARGET_DIR` naming the build dir's own `target/`, unless mutants are tested
-/// in place.
+/// Variables that switch incremental compilation for every cargo command, each with the
+/// one value that turns it on. Cargo reads `CARGO_INCREMENTAL` first, then
+/// `build.incremental`, whose environment form is `CARGO_BUILD_INCREMENTAL`, then the
+/// profile. Measured in `docs/work/fallback-build-cost/design.md`, Measured 10.
+const INCREMENTAL_SWITCHES: [(&str, &str); 2] = [
+    ("CARGO_INCREMENTAL", "1"),
+    ("CARGO_BUILD_INCREMENTAL", "true"),
+];
+
+/// The incremental switches in `var` that a scratch build dir removes: those set to
+/// anything that turns incremental off. None in place.
 ///
-/// A target dir that the user sets in the environment or in cargo config would
-/// otherwise be shared by all the build dirs, so that concurrent jobs would build into
-/// it at once and test each other's mutants. `CARGO_TARGET_DIR` takes precedence over
-/// both. In place, there's only one build dir, which is the user's own tree, so their
-/// setting is kept.
-pub(crate) fn build_dir_cargo_env(
-    build_dir: &BuildDir,
+/// A switch that turns incremental on stays, because removing it would turn incremental
+/// off for a profile that says `incremental = false` (Measured 14).
+///
+/// `var` reads one variable, so that tests don't change the process environment.
+pub(crate) fn incremental_switches_to_remove(
     options: &Options,
-) -> Vec<(String, String)> {
-    let mut env = cargo_env(options);
+    var: impl Fn(&str) -> Option<String>,
+) -> Vec<String> {
+    if options.in_place {
+        return Vec::new();
+    }
+    INCREMENTAL_SWITCHES
+        .iter()
+        .filter(|(name, on)| var(name).is_some_and(|value| value != *on))
+        .map(|(name, _)| (*name).to_owned())
+        .collect()
+}
+
+/// Variables that a scratch build dir overrides with its own value.
+const OVERRIDDEN_IN_BUILD_DIRS: [&str; 2] = ["CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"];
+
+/// What a run in scratch build dirs takes from cargo-mutants' environment and changes:
+/// each variable that was set, with the value it had.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct EnvOverrides {
+    /// Set, and replaced by the build dir's own value.
+    pub overridden: BTreeMap<String, String>,
+    /// Set, and removed, so that cargo config and the profile decide.
+    pub removed: BTreeMap<String, String>,
+}
+
+/// The variables in `var` that scratch build dirs override or remove; none in place.
+///
+/// `var` reads one variable, so that tests don't change the process environment.
+pub(crate) fn env_overrides(
+    options: &Options,
+    var: impl Fn(&str) -> Option<String>,
+) -> EnvOverrides {
+    if options.in_place {
+        return EnvOverrides::default();
+    }
+    let with_value = |name: &str| var(name).map(|value| (name.to_owned(), value));
+    EnvOverrides {
+        overridden: OVERRIDDEN_IN_BUILD_DIRS
+            .iter()
+            .filter_map(|name| with_value(name))
+            .collect(),
+        // the same decision as the removal itself, so the report and the removal agree
+        removed: incremental_switches_to_remove(options, &var)
+            .iter()
+            .filter_map(|name| with_value(name))
+            .collect(),
+    }
+}
+
+/// Report, once per run, what the build dirs change in cargo-mutants' environment.
+///
+/// `build_dir_cargo_env` runs for every process, including every replayed test, so it
+/// reports nothing itself.
+pub(crate) fn report_env_overrides(overrides: &EnvOverrides) {
+    if overrides.overridden.is_empty() && overrides.removed.is_empty() {
+        return;
+    }
+    debug!(
+        overridden = ?overrides.overridden,
+        removed = ?overrides.removed,
+        "build_dirs.env_overrides"
+    );
+    if !overrides.removed.is_empty() {
+        let removed = overrides
+            .removed
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join(" and ");
+        info!(
+            "Removed {removed} in scratch build dirs, so cargo config and the profile decide \
+            incremental compilation there. To keep it off, set `incremental = false` in the \
+            profile, CARGO_PROFILE_<NAME>_INCREMENTAL=false, or `build.incremental = false` \
+            in cargo config"
+        );
+    }
+}
+
+/// Environment changes for cargo run in `build_dir`.
+///
+/// `set` holds those of [`cargo_env`], and `CARGO_TARGET_DIR` naming the build dir's own
+/// `target/`, unless mutants are tested in place. A target dir that the user sets in the
+/// environment or in cargo config would otherwise be shared by all the build dirs, so that
+/// concurrent jobs would build into it at once and test each other's mutants.
+/// `CARGO_TARGET_DIR` takes precedence over both.
+///
+/// `remove` holds the switches [`incremental_switches_to_remove`] names. A scratch build
+/// dir rebuilds the mutated package once per mutant, so a switch that a shell or a CI job
+/// sets to save disk would make every one of those builds start from nothing.
+///
+/// In place, there's only one build dir, which is the user's own tree, so their settings
+/// are kept.
+pub(crate) fn build_dir_cargo_env(build_dir: &BuildDir, options: &Options) -> Env {
+    let mut set = cargo_env(options);
     if !options.in_place {
         let target_dir = build_dir.path().join("target");
-        for name in ["CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"] {
-            if let Some(value) = env::var_os(name) {
-                debug!(
-                    %target_dir,
-                    "Overriding {name}={value:?} from the environment with the build dir's own target dir"
-                );
-            }
-        }
-        env.push(("CARGO_TARGET_DIR".to_owned(), target_dir.into_string()));
+        set.push(("CARGO_TARGET_DIR".to_owned(), target_dir.into_string()));
     }
-    env
+    Env {
+        set,
+        remove: incremental_switches_to_remove(options, |name| env::var(name).ok()),
+    }
 }
 
 /// Return the name of the cargo binary.
@@ -248,8 +551,10 @@ fn encoded_rustflags(options: &Options) -> Option<String> {
 #[cfg(test)]
 mod test {
     use clap::Parser;
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
     use rusty_fork::rusty_fork_test;
+    use serde_json::json;
 
     use crate::{
         Args,
@@ -264,6 +569,7 @@ mod test {
         let build_dir = BuildDir::in_place(tmp.path().try_into().unwrap()).unwrap();
         let target_dir = |options: &Options| {
             build_dir_cargo_env(&build_dir, options)
+                .set
                 .into_iter()
                 .find(|(name, _)| name == "CARGO_TARGET_DIR")
                 .map(|(_, value)| value)
@@ -277,6 +583,385 @@ mod test {
             ..Options::default()
         };
         assert_eq!(target_dir(&in_place), None);
+    }
+
+    #[test]
+    fn incremental_switches_that_turn_incremental_off_are_removed_except_in_place() {
+        let off = |name: &str| match name {
+            "CARGO_INCREMENTAL" => Some("0".to_owned()),
+            "CARGO_BUILD_INCREMENTAL" => Some("false".to_owned()),
+            _ => None,
+        };
+        assert_eq!(
+            incremental_switches_to_remove(&Options::default(), off),
+            ["CARGO_INCREMENTAL", "CARGO_BUILD_INCREMENTAL"]
+        );
+        let in_place = Options {
+            in_place: true,
+            ..Options::default()
+        };
+        assert_eq!(
+            incremental_switches_to_remove(&in_place, off),
+            Vec::<String>::new()
+        );
+    }
+
+    /// A switch that turns incremental on stays: removing it would turn incremental off for a
+    /// profile that says `incremental = false`.
+    #[test]
+    fn incremental_switches_that_turn_incremental_on_or_are_unset_are_kept() {
+        let on = |name: &str| match name {
+            "CARGO_INCREMENTAL" => Some("1".to_owned()),
+            "CARGO_BUILD_INCREMENTAL" => Some("true".to_owned()),
+            _ => None,
+        };
+        assert_eq!(
+            incremental_switches_to_remove(&Options::default(), on),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            incremental_switches_to_remove(&Options::default(), |_| None),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn env_overrides_names_each_variable_a_scratch_build_dir_overrides_or_removes() {
+        let vars = [("CARGO_TARGET_DIR", "/shared"), ("CARGO_INCREMENTAL", "0")];
+        let var = |name: &str| {
+            vars.iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, value)| (*value).to_owned())
+        };
+        let overrides = env_overrides(&Options::default(), var);
+        assert_eq!(
+            overrides.overridden,
+            BTreeMap::from([("CARGO_TARGET_DIR".to_owned(), "/shared".to_owned())])
+        );
+        assert_eq!(
+            overrides.removed,
+            BTreeMap::from([("CARGO_INCREMENTAL".to_owned(), "0".to_owned())])
+        );
+    }
+
+    #[test]
+    fn env_overrides_is_empty_in_place_or_when_nothing_is_set() {
+        let set = |name: &str| Some(format!("value of {name}"));
+        let in_place = Options {
+            in_place: true,
+            ..Options::default()
+        };
+        assert_eq!(env_overrides(&in_place, set), EnvOverrides::default());
+        assert_eq!(
+            env_overrides(&Options::default(), |_| None),
+            EnvOverrides::default()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn ran_out_of_disk_matches_enospc_by_its_text_or_its_code() {
+        assert!(
+            ran_out_of_disk(
+                "error: could not write output to /t/deps/x.rcgu.o: No space left on device\n"
+            )
+            .is_some()
+        );
+        assert!(ran_out_of_disk("error: failed to write /t/check (os error 28)\n").is_some());
+    }
+
+    /// The text of `ERROR_DISK_FULL` is localized. Its code is not.
+    #[test]
+    #[cfg(windows)]
+    fn ran_out_of_disk_matches_error_disk_full_by_its_text_or_its_code() {
+        assert!(
+            ran_out_of_disk(
+                "error: failed to write /t/x: There is not enough space on the disk.\n"
+            )
+            .is_some()
+        );
+        assert!(
+            ran_out_of_disk(
+                "error: failed to write /t/x: Espace insuffisant sur le disque. (os error 112)\n"
+            )
+            .is_some()
+        );
+    }
+
+    /// `ERROR_HANDLE_DISK_FULL` is a full disk too. Its text is localized and its code is not.
+    #[test]
+    #[cfg(windows)]
+    fn ran_out_of_disk_matches_error_handle_disk_full_by_its_text_or_its_code() {
+        assert!(ran_out_of_disk("error: failed to write /t/x: The disk is full.\n").is_some());
+        assert!(
+            ran_out_of_disk("error: failed to write /t/x: Le disque est plein. (os error 39)\n")
+                .is_some()
+        );
+    }
+
+    /// A quota exceeded is a full disk too: the build could not write. `EDQUOT` is 122 on
+    /// Linux and 69 on macOS, and each spells its text its own way.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn ran_out_of_disk_matches_edquot_by_its_text_or_its_code() {
+        let (text, code) = if cfg!(target_os = "linux") {
+            ("Disk quota exceeded", "(os error 122)")
+        } else {
+            ("Disc quota exceeded", "(os error 69)")
+        };
+        assert!(ran_out_of_disk(&format!("error: failed to write /t/x: {text}\n")).is_some());
+        assert!(ran_out_of_disk(&format!("error: failed to write /t/x {code}\n")).is_some());
+    }
+
+    /// An error code names a full disk on one platform only.
+    #[test]
+    fn ran_out_of_disk_does_not_match_another_platforms_error_code() {
+        // linux `EHOSTDOWN`
+        #[cfg(unix)]
+        assert_eq!(
+            ran_out_of_disk("error: Host is down (os error 112)\n"),
+            None
+        );
+        // windows `ERROR_OUT_OF_PAPER`
+        #[cfg(windows)]
+        assert_eq!(
+            ran_out_of_disk("error: The printer is out of paper. (os error 28)\n"),
+            None
+        );
+        // macos `EDQUOT` is linux `ESRMOUNT`. windows `ERROR_HANDLE_DISK_FULL` is linux `ENOTEMPTY`
+        #[cfg(target_os = "linux")]
+        for other in [
+            "Srmount error (os error 69)",
+            "Directory not empty (os error 39)",
+        ] {
+            assert_eq!(ran_out_of_disk(other), None, "{other}");
+        }
+        // linux `EDQUOT` is no macos error. windows `ERROR_HANDLE_DISK_FULL` is macos `EDESTADDRREQ`
+        #[cfg(target_os = "macos")]
+        for other in [
+            "Unknown error: 122 (os error 122)",
+            "Destination address required (os error 39)",
+        ] {
+            assert_eq!(ran_out_of_disk(other), None, "{other}");
+        }
+        // macos `EDQUOT` is `ERROR_TOO_MANY_SESS`, and linux `EDQUOT` is `ERROR_INSUFFICIENT_BUFFER`
+        #[cfg(windows)]
+        for other in [
+            "The network BIOS session limit was exceeded. (os error 69)",
+            "The data area passed to a system call is too small. (os error 122)",
+        ] {
+            assert_eq!(ran_out_of_disk(other), None, "{other}");
+        }
+    }
+
+    #[test]
+    fn ran_out_of_disk_does_not_match_a_compile_error_or_nothing() {
+        assert_eq!(
+            ran_out_of_disk("error[E0308]: mismatched types\n  --> src/lib.rs:2:5\n"),
+            None
+        );
+        assert_eq!(ran_out_of_disk(""), None);
+    }
+
+    /// A compile error quotes source lines. cargo-mutants' own source holds the message as a
+    /// literal, and its CI runs cargo-mutants on itself.
+    #[test]
+    fn ran_out_of_disk_does_not_match_a_quoted_source_line() {
+        assert_eq!(
+            ran_out_of_disk(indoc! {r#"
+            error[E0308]: mismatched types
+              --> src/cargo.rs:30:5
+               |
+            30 |     "No space left on device",
+               |     ^^^^^^^^^^^^^^^^^^^^^^^^^ expected `u8`, found `&str`
+        "#}),
+            None
+        );
+        // a suggestion's removed, added and changed lines
+        for symbol in ['-', '+', '~'] {
+            let suggestion = format!(
+                "help: consider this\n   |\n4  {symbol}     report(\"No space left on device\");\n"
+            );
+            assert_eq!(ran_out_of_disk(&suggestion), None, "{symbol}");
+        }
+    }
+
+    /// cargo prints a build script's warning as `warning: <package>@<version>: <text>`, and
+    /// replays it on every later build. cc-rs forwards a C compiler's diagnostics that way,
+    /// quoted source included.
+    #[test]
+    fn ran_out_of_disk_reads_a_build_script_warning_without_its_prefix() {
+        assert_eq!(
+            ran_out_of_disk(
+                "warning: p3@0.1.0:     3 |     const char *unused_fallback = \"No space left on device\";\n"
+            ),
+            None
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            ran_out_of_disk(
+                "warning: p3@0.1.0: error: could not write /t/x.o: No space left on device\n"
+            )
+            .as_deref(),
+            Some("warning: p3@0.1.0: error: could not write /t/x.o: No space left on device")
+        );
+    }
+
+    /// Only cargo's own prefix for a build script's warning comes off: a package name, `@`,
+    /// and a version that starts with a digit.
+    #[test]
+    fn without_build_script_prefix_takes_off_only_a_package_and_version() {
+        assert_eq!(without_build_script_prefix("warning: p3@0.1.0: x"), "x");
+        assert_eq!(
+            without_build_script_prefix("warning: cc_rs-2@1.2.3-rc.1+b.5: x"),
+            "x"
+        );
+        for kept in [
+            "warning: unused import: x",
+            "warning: a b@0.1.0: x",
+            "warning: p3@v1: x",
+        ] {
+            assert_eq!(without_build_script_prefix(kept), kept);
+        }
+    }
+
+    /// rustc quotes source only on a gutter line: a number, a space, then one of `|-+~`
+    /// followed by a space or the end of the line, or a bare `|`.
+    #[test]
+    fn quotes_source_only_on_rustc_gutter_lines() {
+        assert!(quotes_source("   |     ^^^^ expected `u8`"));
+        assert!(quotes_source("30 |     let x = 1;"));
+        assert!(quotes_source("4  -"));
+        // no space between the number and the bar
+        assert!(!quotes_source("4| x"));
+        // the symbol is not followed by a space
+        assert!(!quotes_source("4 -> x"));
+    }
+
+    /// The macOS linker reports a full disk by its error number only.
+    #[test]
+    #[cfg(unix)]
+    fn ran_out_of_disk_matches_the_linker_only_for_errno_28() {
+        assert!(
+            ran_out_of_disk(indoc! {"
+            error: linking with `cc` failed: exit status: 1
+              = note: ld: ftruncate() failed, errno=28 for '/t/deps/x-1234'
+        "})
+            .is_some()
+        );
+        assert_eq!(
+            ran_out_of_disk(indoc! {"
+            error: linking with `cc` failed: exit status: 1
+              = note: ld: library 'z' not found
+        "}),
+            None
+        );
+        // the error number alone is not the linker's
+        assert_eq!(ran_out_of_disk("error: write failed, errno=28\n"), None);
+    }
+
+    /// With `--message-format=json`, rustc puts the linker's output in a child message.
+    #[test]
+    #[cfg(unix)]
+    fn ran_out_of_disk_matches_the_linker_in_a_json_compiler_message() {
+        let linker = json!({
+            "reason": "compiler-message",
+            "message": {
+                "level": "error",
+                "message": "linking with `cc` failed: exit status: 1",
+                "children": [
+                    {"level": "note", "message": "\"cc\" \"-arch\" \"arm64\" \"/t/deps/x.o\"", "children": [], "spans": [], "rendered": null},
+                    {"level": "note", "message": "ld: ftruncate() failed, errno=28 for '/t/deps/x-1234'\nclang: error: linker command failed with exit code 1", "children": [], "spans": [], "rendered": null},
+                ],
+                "spans": [],
+                "rendered": "error: linking with `cc` failed: exit status: 1\n",
+            },
+        });
+        assert_eq!(
+            ran_out_of_disk(&linker.to_string()).as_deref(),
+            Some("ld: ftruncate() failed, errno=28 for '/t/deps/x-1234'")
+        );
+    }
+
+    /// With `--message-format=json`, which the schema's check and build use, a diagnostic is one
+    /// line. Its own message counts. Its rendered text and spans quote source, so they don't.
+    #[test]
+    fn ran_out_of_disk_reads_only_the_messages_of_a_json_compiler_message() {
+        #[cfg(unix)]
+        let full = json!({
+            "reason": "compiler-message",
+            "message": {
+                "level": "error",
+                "message": "could not write output to /t/deps/x.rcgu.o: No space left on device",
+                "children": [],
+                "spans": [],
+                "rendered": "error: could not write output to /t/deps/x.rcgu.o: No space left on device\n",
+            },
+        });
+        #[cfg(unix)]
+        assert!(ran_out_of_disk(&full.to_string()).is_some());
+        let quoted = json!({
+            "reason": "compiler-message",
+            "message": {
+                "level": "warning",
+                "message": "unused variable: `expected`",
+                "children": [{
+                    "level": "help",
+                    "message": "if this is intentional, prefix it with an underscore: `_expected`",
+                    "children": [],
+                    "spans": [],
+                    "rendered": null,
+                }],
+                "spans": [{"text": [{"text": "    let expected = \"No space left on device\";"}]}],
+                "rendered": "warning: unused variable: `expected`\n --> src/lib.rs:4:9\n  |\n4 |     let expected = \"No space left on device\";\n",
+            },
+        });
+        assert_eq!(ran_out_of_disk(&quoted.to_string()), None);
+    }
+
+    /// With `CARGO_TERM_COLOR=always`, which the fork's CI sets, cargo colors its output,
+    /// and a quoted source line starts with an escape sequence rather than its number.
+    #[test]
+    fn ran_out_of_disk_does_not_match_a_colored_quoted_source_line() {
+        assert_eq!(
+            ran_out_of_disk(
+                "\x1b[1m\x1b[94m12\x1b[0m \x1b[1m\x1b[94m|\x1b[0m         let expected = \"No space left on device\";\n"
+            ),
+            None
+        );
+        #[cfg(unix)]
+        assert!(
+            ran_out_of_disk(
+                "\x1b[1m\x1b[91merror\x1b[0m\x1b[1m: No space left on device (os error 28)\x1b[0m\n"
+            )
+            .is_some()
+        );
+    }
+
+    /// Only a failed check or build is read. A test's own output can say the disk is
+    /// full, and a test that fails is a caught mutant. The error quotes the line that
+    /// matched, so a false stop explains itself.
+    #[test]
+    fn stop_if_disk_full_reads_only_a_failed_check_or_build() {
+        let log_path = Utf8Path::new("log/x.log");
+        let line = if cfg!(windows) {
+            "error: There is not enough space on the disk."
+        } else {
+            "error: No space left on device"
+        };
+        let full = || -> Result<String> { Ok(format!("   Compiling x v0.1.0\n{line}\n")) };
+        let unread = || -> Result<&str> { bail!("the output was read") };
+        for phase in [Phase::Check, Phase::Build] {
+            let err = stop_if_disk_full(phase, Exit::Failure(101), full, log_path).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "the disk is full: cargo {phase} failed; see log/x.log, which says: {line}"
+                )
+            );
+            stop_if_disk_full(phase, Exit::Success, unread, log_path).unwrap();
+        }
+        stop_if_disk_full(Phase::Test, Exit::Failure(101), unread, log_path).unwrap();
     }
 
     #[test]

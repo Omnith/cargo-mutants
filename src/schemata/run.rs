@@ -25,7 +25,7 @@ use super::markers::Markers;
 use super::plan::FallbackReason;
 use super::replay::{Quoting, ReplayCommand, test_commands};
 use crate::build_dir::BuildDir;
-use crate::cargo::{build_dir_cargo_env, cargo_argv};
+use crate::cargo::{build_dir_cargo_env, cargo_argv, stop_if_disk_full};
 use crate::console::Console;
 use crate::fail_fast::{KnownTests, KnownTestsBySelection};
 use crate::interrupt::check_interrupted;
@@ -33,7 +33,7 @@ use crate::options::Options;
 use crate::outcome::{Phase, PhaseResult, ScenarioOutcome, SummaryOutcome};
 use crate::output::{OutputDir, ScenarioOutput};
 use crate::package::PackageSelection;
-use crate::process::{Exit, Process, TERMINATES_DESCENDANTS};
+use crate::process::{Env, Exit, Process, TERMINATES_DESCENDANTS};
 use crate::scenario::Scenario;
 use crate::timeouts::Timeouts;
 use crate::{Mutant, Result};
@@ -237,12 +237,13 @@ pub(crate) struct Runner<'a> {
 }
 
 impl Runner<'_> {
-    /// The environment variables to set for cargo, and for the test commands it runs,
-    /// in the build directory: every schema step gets them from here.
+    /// The environment changes for cargo, and for the test commands it runs, in the
+    /// build directory: every schema step gets them from here.
     ///
     /// Like the classic path, this builds into the build directory's own `target/`,
-    /// whatever `CARGO_TARGET_DIR` or `build.target-dir` say.
-    pub(crate) fn cargo_env(&self) -> Vec<(String, String)> {
+    /// whatever `CARGO_TARGET_DIR` or `build.target-dir` say, and removes the global
+    /// incremental switches that turn incremental compilation off.
+    pub(crate) fn cargo_env(&self) -> Env {
         build_dir_cargo_env(self.build_dir, self.options)
     }
 
@@ -257,11 +258,14 @@ impl Runner<'_> {
     /// Run one cargo command, logging to a log named `log_name`.
     ///
     /// Returns the phase result and the full log text.
+    ///
+    /// A check or build that fails because the disk is full is an error, as in
+    /// `run_cargo`. Each step has its own log, so the whole text is this step's.
     pub(crate) fn run_step(
         &self,
         phase: Phase,
         argv: Vec<String>,
-        env: &[(String, String)],
+        env: &Env,
         timeout: Option<Duration>,
         log_name: &str,
     ) -> Result<(PhaseResult, String, Utf8PathBuf)> {
@@ -284,6 +288,7 @@ impl Runner<'_> {
         check_interrupted()?;
         let log_path = log.output_dir.join(log.log_path());
         let text = read_to_string(&log_path)?;
+        stop_if_disk_full(phase, process_status, || Ok(text.as_str()), &log_path)?;
         Ok((
             PhaseResult {
                 phase,
@@ -676,8 +681,8 @@ impl Runner<'_> {
         stop_on_failure: Option<&KnownTests>,
     ) -> Result<Exit> {
         let mut env = self.cargo_env();
-        env.extend(command.env.iter().cloned());
-        env.push((ID_ENV_VAR.to_owned(), id.to_string()));
+        env.set.extend(command.env.iter().cloned());
+        env.set.push((ID_ENV_VAR.to_owned(), id.to_string()));
         let status = Process::run(
             argv,
             &env,
@@ -1012,9 +1017,9 @@ impl Runner<'_> {
         }
     }
 
-    fn test_env(&self, id: MutantId) -> Vec<(String, String)> {
+    fn test_env(&self, id: MutantId) -> Env {
         let mut env = self.cargo_env();
-        env.push((ID_ENV_VAR.to_owned(), id.to_string()));
+        env.set.push((ID_ENV_VAR.to_owned(), id.to_string()));
         env
     }
 

@@ -389,7 +389,9 @@ fn list_tests(
     create_dir_all(&build_profiles).with_context(|| format!("create {build_profiles}"))?;
     let current_exe = env::current_exe().context("find cargo-mutants executable")?;
     let mut env = runner.cargo_env();
-    env.extend([
+    // One build per run gains nothing from incremental compilation, and its cache is
+    // disk that the run's other build dirs need.
+    env.set.extend([
         (
             "RUSTC_WORKSPACE_WRAPPER".to_owned(),
             current_exe.to_string_lossy().into_owned(),
@@ -402,6 +404,7 @@ fn list_tests(
             "LLVM_PROFILE_FILE".to_owned(),
             build_profiles.join("%p.profraw").to_string(),
         ),
+        ("CARGO_INCREMENTAL".to_owned(), "0".to_owned()),
     ]);
     let (result, log, log_path) = runner.run_step(
         Phase::Test,
@@ -499,8 +502,8 @@ fn run_tests(
                         let profile_dir = selection_dir.join(format!("profiles-{index}"));
                         create_dir_all(&profile_dir)?;
                         let mut env = runner.cargo_env();
-                        env.extend(command.env.iter().cloned());
-                        env.push((
+                        env.set.extend(command.env.iter().cloned());
+                        env.set.push((
                             "LLVM_PROFILE_FILE".to_owned(),
                             profile_dir.join("%p.profraw").to_string(),
                         ));

@@ -1,0 +1,9 @@
+[package]
+name = "cargo-mutants-testdata-disk-full-literal"
+description = "Source that holds a full disk's message as text, and two unviable mutants"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+doctest = false

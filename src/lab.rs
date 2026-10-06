@@ -313,6 +313,10 @@ impl Lab<'_> {
     ///
     /// Workers take a build dir from `build_dirs` if any are left, or otherwise copy the
     /// workspace.
+    ///
+    /// A worker that fails, while it copies the workspace or while it tests a mutant,
+    /// empties the queue first, so that the other workers stop after the mutant each
+    /// holds, rather than testing every remaining mutant before the run fails.
     fn run_mutants(
         &self,
         mutants: Vec<Mutant>,
@@ -332,13 +336,19 @@ impl Lab<'_> {
                 threads.push(scope.spawn(|| -> crate::Result<()> {
                     trace!(thread_id = ?thread::current().id(), "start thread");
                     let ready_build_dir = ready_build_dirs.lock().expect("lock build dirs").pop(); // separate for lock
-                    let build_dir = &if let Some(d) = ready_build_dir {
-                        d
-                    } else {
-                        BuildDir::copy_from(workspace.root(), self.options, self.console)?
-                    };
-                    self.make_worker(build_dir, known_tests)
-                        .run_queue(work_queue, timeouts)
+                    let result = match ready_build_dir {
+                        Some(d) => Ok(d),
+                        None => BuildDir::copy_from(workspace.root(), self.options, self.console),
+                    }
+                    .and_then(|build_dir| {
+                        self.make_worker(&build_dir, known_tests)
+                            .run_queue(work_queue, timeouts)
+                    });
+                    if result.is_err() {
+                        *work_queue.lock().expect("lock pending work queue") =
+                            Vec::new().into_iter();
+                    }
+                    result
                 }));
             }
             join_threads(threads)
@@ -396,7 +406,7 @@ struct Worker<'a> {
 }
 
 impl Worker<'_> {
-    /// Run until the input queue is empty.
+    /// Run until the input queue is empty, or until a mutant's scenario fails.
     fn run_queue(
         mut self,
         work_queue: &Mutex<vec::IntoIter<Mutant>>,

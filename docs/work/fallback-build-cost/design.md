@@ -247,6 +247,8 @@ rustc's object write, its archive step and cargo itself each print `No space lef
 That is the `strerror` text for `ENOSPC` on macOS and Linux. Windows prints `There is not enough
 space on the disk. (os error 112)` for `ERROR_DISK_FULL`. Both reach a classic mutant's log, and
 `outcome.rs:278` reports the mutant `Unviable` because its build failed.
+A quota exceeded and Windows' `ERROR_HANDLE_DISK_FULL` say the same in other words
+(Measured 16).
 
 **14. Where the first disk-full check went wrong.** Found by the plan's adversarial review,
 2026-10-05, on a scratch build of this plan's detector, and on a filled 60 MB disk image:
@@ -267,6 +269,61 @@ space on the disk. (os error 112)` for `ERROR_DISK_FULL`. Both reach a classic m
   on one worker and exited 1.
 - **Removing `CARGO_INCREMENTAL=1` turns incremental off** when the profile says
   `incremental = false`: `cargo build -v` gave one `incremental=` line with it and none without.
+- **A colored quoted line starts with an escape sequence, not its line number.** Found in
+  Batch B's execution, 2026-10-05. Under `CARGO_TERM_COLOR=always`, which the fork's own CI sets
+  (`.github/workflows/tests.yml:38`), `od -c` on a classic `disk_full_literal` log showed the
+  quoted line as `033[1m033[94m12033[0m 033[1m033[94m|033[0m`. The quoted source rule did not
+  see a line number, so the line counted as a full disk. The integration tests cannot show it,
+  because their `run()` strips `CARGO_TERM_COLOR`.
+
+**15. What cargo prints for a build script's warning.** Found by the pull request's adversarial
+review, 2026-10-05: with `cc = "=1.4.7"`, a C compiler's warning that quoted
+`"No space left on device"` stopped both paths with "the disk is full". Measured on cargo
+1.96.0 the same day, with a scratch crate whose build script prints two `cargo:warning=` lines and
+`cargo:rerun-if-changed=build.rs`:
+
+```
+warning: p3@0.1.0:     3 |     const char *unused_fallback = "No space left on device";
+warning: p3@0.1.0: error: could not write /t/x.o: No space left on device
+```
+
+- A later build that does not run the build script prints both lines again.
+- Under `CARGO_TERM_COLOR=always` the prefix is `033[1m033[33mwarning033[0m: p3@0.1.0: `.
+  Without its escape sequences it is the same prefix.
+- With `--message-format=json` the same plain lines go to stderr.
+- A build script that fails also prints its output raw, under `--- stdout`:
+  `  cargo:warning=    3 |     const char ...`. The prefix rule does not reach that line.
+
+**16. Other errors that mean the build could not write.** Found by the pull request's adversarial
+review, 2026-10-05: the markers knew `ENOSPC` and `ERROR_DISK_FULL` only. Measured the same day.
+On this Mac, Darwin 24.6.0:
+
+```
+$ python3 -c 'import os; print(repr(os.strerror(69))); print(repr(os.strerror(122)))'
+'Disc quota exceeded'
+'Unknown error: 122'
+```
+
+In `debian:bookworm-slim`, and Rust's `io::Error::from_raw_os_error` in `rust:1-bookworm`:
+
+```
+$ perl -e 'for (122, 69, 28, 39) { $! = $_; print "$_: $!\n" }'
+122: Disk quota exceeded
+69: Srmount error
+28: No space left on device
+39: Directory not empty
+$ ./e    # prints io::Error::from_raw_os_error for 122, 69, 28 and 39
+Disk quota exceeded (os error 122)
+Srmount error (os error 69)
+No space left on device (os error 28)
+Directory not empty (os error 39)
+```
+
+The same Rust program on the Mac printed `Disc quota exceeded (os error 69)` and
+`Destination address required (os error 39)`. Microsoft's "System Error Codes (0-499)" gives
+`ERROR_HANDLE_DISK_FULL` as 39 (0x27), "The disk is full." It gives 69 as
+`ERROR_TOO_MANY_SESS` and 122 as `ERROR_INSUFFICIENT_BUFFER`. So 69, 122 and 39 each name a
+full disk on one platform and something else on another.
 
 Re-derive Measured 1 and 2: read the named key from `mutants.out/schemata.json`, or sum
 `phase_results[].duration` by phase in `outcomes.json` for the mutants named in
@@ -334,20 +391,45 @@ a gate that counts misses still passes. This item adds disk use (Measured 8), so
 more likely, and the fix is small. When a check or build phase fails and the output that phase
 reports the disk full, the phase returns an error instead of a result (Measured 13 and 14).
 The run then stops the way any internal error stops it: the mutant is reverted, `main` returns
-the error, and the process exits non-zero. The message names the full disk and the phase's log.
+the error, and the process exits non-zero. It exits 1, as every internal error does, and gets no
+exit code of its own: a full disk is an error, not a result, so it takes the path every other
+error takes. The message names the full disk and the phase's log, and quotes the line that
+matched, so a false stop explains itself.
 A gate that checks its population against the outcomes then fails on the partial run as well.
 
 **What counts as the disk reporting full.** The text of a source line can hold the same words,
 so the check reads only what the toolchain says, never what it quotes:
 - A cargo JSON compiler message counts only through its `message` and its children's `message`
-  fields. Its `rendered` text and its spans quote source.
+  fields, each read line by line. Its `rendered` text and its spans quote source. A child can
+  hold the linker's whole output.
 - Another JSON line, such as an artifact notice, never counts.
+- A plain line loses its ANSI control sequences first, because cargo colors its output under
+  `CARGO_TERM_COLOR=always` (Measured 14).
+- A plain line then loses cargo's prefix for a build script's warning,
+  `warning: <package>@<version>: `. cargo replays a build script's warnings on every later build,
+  and cc-rs forwards a C compiler's diagnostics that way, quoted source included (Measured 15).
 - A plain line counts unless rustc is quoting source on it: a line that, trimmed of leading
-  space, starts with `|`, or with digits followed by ` |`, ` -`, ` +` or ` ~`.
-- The markers are `No space left on device` and `(os error 28)` (macOS and Linux, `ENOSPC`),
-  `There is not enough space on the disk` and `(os error 112)` (Windows, `ERROR_DISK_FULL`, whose
-  text is localized but whose code is not), and `errno=28` on a line that holds `ld:` (the macOS
-  linker).
+  space, starts with `|`, or with digits, one or more spaces, and one of `|`, `-`, `+` or `~`
+  followed by a space or the end of the line.
+- A line counts when it holds a marker of the platform cargo-mutants runs on. On every unix
+  system the markers are `No space left on device` and `(os error 28)` (`ENOSPC`), and `errno=28`
+  on a line that also holds `ld:` (the macOS linker). A quota exceeded counts too, because the
+  build could not write and the mutant is not unviable. Linux adds `Disk quota exceeded` and
+  `(os error 122)` (`EDQUOT`). macOS adds `Disc quota exceeded`, Apple's spelling, and
+  `(os error 69)` (`EDQUOT`). Other unix systems number `EDQUOT` their own way, and none was
+  measured, so they keep `ENOSPC` only. On Windows the markers are
+  `There is not enough space on the disk` and `(os error 112)` (`ERROR_DISK_FULL`), and
+  `The disk is full` and `(os error 39)` (`ERROR_HANDLE_DISK_FULL`). Each Windows text is
+  localized and its code is not (Measured 16). The same rule applies to a plain line and to each
+  line of a JSON `message` field.
+- **This rule read every platform's markers on every platform, and the linker rule only on plain
+  lines. Both were wrong.** Linux's `(os error 112)` is `EHOSTDOWN`, measured in a debian
+  container, so a host that is down read as a full disk. With `--message-format=json`, which
+  the schema's build uses, rustc puts the linker's note in a child `message`, so a full disk at
+  link time made every embedded mutant fall back as an unattributed compile error.
+- **This rule read a build script's warning whole, which was wrong.** cargo's prefix hid a
+  forwarded gutter line from the quoted source rule, so a C compiler's quoted source stopped a
+  healthy run (Measured 15).
 
 **One worker's disk-full error stops the others.** A worker that gets the error empties the
 shared queue before it returns, so every other worker finishes the mutant it holds and takes no
@@ -403,11 +485,17 @@ through the existing `serde_json` parsing style of `src/schemata/diagnostics.rs`
 own source holds the markers as literals, and its CI runs cargo-mutants on itself, so the quoted
 source rule is not optional.
 
-**`Worker::run_queue` empties the queue on an error** from `run_one_scenario`, under the queue's
-lock, then returns the error. `run_cargo` and
-`Runner::run_step` call it only for a failed check or build phase, and return an error that names
-the disk and the log path. The text of a phase is what it appended to the scenario's log, not the
-whole log, so an earlier phase's output cannot match.
+**A worker thread in `run_mutants` empties the queue on any error**, under the queue's lock, then
+returns the error. That covers a failed copy of the workspace as well as a failed scenario.
+**This said `Worker::run_queue` emptied it, which was wrong:** a copy that failed because the disk
+was full returned before `run_queue` ran, and left the queue full.
+
+**`stop_if_disk_full` alone decides which phases are checked.** `run_cargo` and
+`Runner::run_step` pass it the phase, the exit status, a reader of the phase's output and the log
+path. It calls the reader only for a failed check or build, and returns an error that names the
+disk and the log path and quotes the line that matched. The text of a phase is what it appended
+to the scenario's log, not the whole log. The log also holds an earlier phase's output and the
+mutation's diff, and neither may match.
 
 **Environment overrides are reported once per run, never per command.** `build_dir_cargo_env`
 runs for every spawned process, including every replayed test command. Its existing
@@ -450,11 +538,16 @@ three reports and the disk-full stop.
    `CARGO_PROFILE_<NAME>_INCREMENTAL=false` as well and asserts no `-C incremental=`. Watch each
    fail on the current code before the change.
 4. **A full disk stops the run, and nothing else does.**
-   - Unit tests of the detector. Each marker of Measured 13 and 14 matches, including the macOS
-     linker's note and a JSON compiler message whose own `message` is rustc's ENOSPC text. A
+   - Unit tests of the detector. Each marker of Measured 13 and 14 matches on its own, on the
+     platform that has it. So do the macOS linker's note, as a plain line and in a JSON child
+     `message`, and a JSON compiler message whose own `message` is rustc's ENOSPC text. Another
+     platform's error code does not match. A linker failure without `errno=28` does not match,
+     nor does `errno=28` without `ld:`. A
      compile error that does not mention the disk does not match, nor does empty text. Neither
-     does a quoted source line in each form: a `NN |` line, a `NN -` suggestion line, and a
-     JSON compiler message that holds the marker only in its `rendered` text and spans.
+     does a quoted source line in each form: a `NN |` line, a `NN -`, `NN +` and `NN ~`
+     suggestion line, a colored `NN |` line, a build script's warning that forwards a gutter line, and a JSON compiler message
+     that holds the marker only in its `rendered` text and spans. A build script's warning that
+     forwards the error itself does match.
    - Integration tests on a testdata tree with several functions. Its build script prints
      `No space left on device` and fails only when one mutation is present. Run with
      `--no-schemata -j2 --no-shuffle` and with `--schemata`. cargo-mutants exits non-zero, its
