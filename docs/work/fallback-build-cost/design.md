@@ -340,7 +340,9 @@ a gate that counts misses still passes. This item adds disk use (Measured 8), so
 more likely, and the fix is small. When a check or build phase fails and the output that phase
 reports the disk full, the phase returns an error instead of a result (Measured 13 and 14).
 The run then stops the way any internal error stops it: the mutant is reverted, `main` returns
-the error, and the process exits non-zero. The message names the full disk and the phase's log.
+the error, and the process exits non-zero. It exits 1, as every internal error does, and gets no
+exit code of its own: a full disk is an error, not a result, so it takes the path every other
+error takes. The message names the full disk and the phase's log.
 A gate that checks its population against the outcomes then fails on the partial run as well.
 
 **What counts as the disk reporting full.** The text of a source line can hold the same words,
@@ -423,10 +425,14 @@ source rule is not optional.
 **A worker thread in `run_mutants` empties the queue on any error**, under the queue's lock, then
 returns the error. That covers a failed copy of the workspace as well as a failed scenario.
 **This said `Worker::run_queue` emptied it, which was wrong:** a copy that failed because the disk
-was full returned before `run_queue` ran, and left the queue full. `run_cargo` and
-`Runner::run_step` call it only for a failed check or build phase, and return an error that names
-the disk and the log path. The text of a phase is what it appended to the scenario's log, not the
-whole log, so an earlier phase's output cannot match.
+was full returned before `run_queue` ran, and left the queue full.
+
+**`stop_if_disk_full` alone decides which phases are checked.** `run_cargo` and
+`Runner::run_step` pass it the phase, the exit status, a reader of the phase's output and the log
+path. It calls the reader only for a failed check or build, and returns an error that names the
+disk and the log path. The text of a phase is what it appended to the scenario's log, not the
+whole log. The log also holds an earlier phase's output and the mutation's diff, and neither may
+match.
 
 **Environment overrides are reported once per run, never per command.** `build_dir_cargo_env`
 runs for every spawned process, including every replayed test command. Its existing
@@ -469,8 +475,10 @@ three reports and the disk-full stop.
    `CARGO_PROFILE_<NAME>_INCREMENTAL=false` as well and asserts no `-C incremental=`. Watch each
    fail on the current code before the change.
 4. **A full disk stops the run, and nothing else does.**
-   - Unit tests of the detector. Each marker of Measured 13 and 14 matches, including the macOS
-     linker's note and a JSON compiler message whose own `message` is rustc's ENOSPC text. A
+   - Unit tests of the detector. Each marker of Measured 13 and 14 matches on its own, on the
+     platform that has it. So do the macOS linker's note, as a plain line and in a JSON child
+     `message`, and a JSON compiler message whose own `message` is rustc's ENOSPC text. Another
+     platform's error code does not match. A linker failure without `errno=28` does not match. A
      compile error that does not mention the disk does not match, nor does empty text. Neither
      does a quoted source line in each form: a `NN |` line, a `NN -` suggestion line, a colored
      `NN |` line, and a JSON compiler message that holds the marker only in its `rendered` text and spans.
