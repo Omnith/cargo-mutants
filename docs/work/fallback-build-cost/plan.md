@@ -1294,7 +1294,7 @@ git commit -m 'Describe incremental scratch builds and the disk-full stop' -- NE
 
 This is design Acceptance criterion 5. It needs Docker, and about 12 GiB free at the start.
 
-- [ ] **Step 1: disk and setup.** `df -h ~/repos`. Stop if under 12 GiB.
+- [x] **Step 1: disk and setup.** `df -h ~/repos`. Stop if under 12 GiB.
 
 ```
 git -C ~/repos/cargo-mutants worktree add <scratch>/fork-old 2f837e8
@@ -1308,7 +1308,7 @@ git -C ~/repos/om-jastusa/remote-build-platform-v2 worktree add --detach <scratc
 `cargo install`: other sessions run the installed `cargo mutants` and must not see a new
 binary mid-run. Invoke each binary by path, as `<binary> mutants ...`.
 
-- [ ] **Step 2: Postgres and MinIO** for the jast worktree, on ports no other session uses.
+- [x] **Step 2: Postgres and MinIO** for the jast worktree, on ports no other session uses.
   Other sessions hold 5432, 9000, 55434 and 59002. First check that the two ports are free:
   `lsof -i :55436 -i :59006` prints nothing. Then:
 
@@ -1317,7 +1317,7 @@ cd <scratch>/jast && JAST_DB_PORT=55436 JAST_MINIO_PORT=59006 COMPOSE_PROJECT_NA
 cd <scratch>/jast && JAST_DB_PORT=55436 JAST_MINIO_PORT=59006 COMPOSE_PROJECT_NAME=rbp-fbc just dev-minio
 ```
 
-- [ ] **Step 3: five runs, back to back**, each in the jast worktree, with its ports and its own
+- [x] **Step 3: five runs, back to back**, each in the jast worktree, with its ports and its own
   `--output`. Without the ports, the jast tests default to 5432 and 9000 and write into another
   session's Postgres and MinIO (`apps/backend-core/tests/pg.rs:53`, `tests/s3.rs:55`).
 
@@ -1343,7 +1343,7 @@ cd <scratch>/jast && JAST_DB_PORT=55436 JAST_MINIO_PORT=59006 <env> <binary> mut
 Before each run, `df -h ~/repos`. Stop and report if under 10 GiB: a full disk during an old-rev
 run would record mutants unviable without a word. Record `uptime` after each run.
 
-- [ ] **Step 4: check each criterion and record the evidence.**
+- [x] **Step 4: check each criterion and record the evidence.**
   - Outcomes identical across all five: one `name<TAB>summary` list per run from `outcomes.json`,
     then `diff`. Expected: no difference. Measured 12 had 337 mutants, 280 caught and 57 unviable.
     If one differs, rerun that mutant alone with both binaries (`--re '<exact name>'`, same
@@ -1370,7 +1370,11 @@ git -C ~/repos/cargo-mutants worktree remove --force <scratch>/fork-old
 Keep the five `out-<run>/mutants.out/schemata.json` and `outcomes.json` files. Delete the rest of
 each output directory.
 
-- [ ] **Step 6: write `docs/work/fallback-build-cost/impl.md`.** It holds what shipped, the
+Open: the compose project is down, with its volumes. The session's permission classifier refused
+the two `worktree remove --force` lines and the trim of each `out-<run>`, so Batch D's implementer
+left them for the orchestrator.
+
+- [x] **Step 6: write `docs/work/fallback-build-cost/impl.md`.** It holds what shipped, the
   table of the five runs with their load averages, and each criterion with its evidence. It has no
   narrative. Commit it:
 
