@@ -237,12 +237,13 @@ pub(crate) struct Runner<'a> {
 }
 
 impl Runner<'_> {
-    /// The environment variables to set for cargo, and for the test commands it runs,
-    /// in the build directory: every schema step gets them from here.
+    /// The environment changes for cargo, and for the test commands it runs, in the
+    /// build directory: every schema step gets them from here.
     ///
     /// Like the classic path, this builds into the build directory's own `target/`,
-    /// whatever `CARGO_TARGET_DIR` or `build.target-dir` say.
-    pub(crate) fn cargo_env(&self) -> Vec<(String, String)> {
+    /// whatever `CARGO_TARGET_DIR` or `build.target-dir` say, and removes the global
+    /// incremental switches that turn incremental compilation off.
+    pub(crate) fn cargo_env(&self) -> Env {
         build_dir_cargo_env(self.build_dir, self.options)
     }
 
@@ -261,7 +262,7 @@ impl Runner<'_> {
         &self,
         phase: Phase,
         argv: Vec<String>,
-        env: &[(String, String)],
+        env: &Env,
         timeout: Option<Duration>,
         log_name: &str,
     ) -> Result<(PhaseResult, String, Utf8PathBuf)> {
@@ -271,13 +272,9 @@ impl Runner<'_> {
             .expect("lock output dir")
             .start_log(log_name)?;
         let start = Instant::now();
-        let env = Env {
-            set: env.to_vec(),
-            remove: Vec::new(),
-        };
         let process_status = Process::run(
             &argv,
-            &env,
+            env,
             self.build_dir.path(),
             timeout,
             self.jobserver,
@@ -680,12 +677,8 @@ impl Runner<'_> {
         stop_on_failure: Option<&KnownTests>,
     ) -> Result<Exit> {
         let mut env = self.cargo_env();
-        env.extend(command.env.iter().cloned());
-        env.push((ID_ENV_VAR.to_owned(), id.to_string()));
-        let env = Env {
-            set: env,
-            remove: Vec::new(),
-        };
+        env.set.extend(command.env.iter().cloned());
+        env.set.push((ID_ENV_VAR.to_owned(), id.to_string()));
         let status = Process::run(
             argv,
             &env,
@@ -1006,10 +999,7 @@ impl Runner<'_> {
             let argv = cargo_argv(selection, Phase::Test, self.options);
             let status = Process::run(
                 &argv,
-                &Env {
-                    set: self.test_env(id),
-                    remove: Vec::new(),
-                },
+                &self.test_env(id),
                 self.build_dir.path(),
                 timeout,
                 self.jobserver,
@@ -1023,9 +1013,9 @@ impl Runner<'_> {
         }
     }
 
-    fn test_env(&self, id: MutantId) -> Vec<(String, String)> {
+    fn test_env(&self, id: MutantId) -> Env {
         let mut env = self.cargo_env();
-        env.push((ID_ENV_VAR.to_owned(), id.to_string()));
+        env.set.push((ID_ENV_VAR.to_owned(), id.to_string()));
         env
     }
 

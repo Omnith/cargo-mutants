@@ -48,13 +48,9 @@ pub fn run_cargo(
     let _span = debug_span!("run", ?phase).entered();
     let start = Instant::now();
     let argv = cargo_argv(packages, phase, options);
-    let env = Env {
-        set: build_dir_cargo_env(build_dir, options),
-        remove: Vec::new(),
-    };
     let process_status = Process::run(
         &argv,
-        &env,
+        &build_dir_cargo_env(build_dir, options),
         build_dir.path(),
         timeout,
         jobserver,
@@ -96,33 +92,60 @@ pub(crate) fn cargo_env(options: &Options) -> Vec<(String, String)> {
     env
 }
 
-/// Environment variables for cargo run in `build_dir`: those of [`cargo_env`], and
-/// `CARGO_TARGET_DIR` naming the build dir's own `target/`, unless mutants are tested
-/// in place.
+/// Variables that switch incremental compilation for every cargo command, each with the
+/// one value that turns it on. Cargo reads `CARGO_INCREMENTAL` first, then
+/// `build.incremental`, whose environment form is `CARGO_BUILD_INCREMENTAL`, then the
+/// profile. Measured in `docs/work/fallback-build-cost/design.md`, Measured 10.
+const INCREMENTAL_SWITCHES: [(&str, &str); 2] = [
+    ("CARGO_INCREMENTAL", "1"),
+    ("CARGO_BUILD_INCREMENTAL", "true"),
+];
+
+/// The incremental switches in `var` that a scratch build dir removes: those set to
+/// anything that turns incremental off. None in place.
 ///
-/// A target dir that the user sets in the environment or in cargo config would
-/// otherwise be shared by all the build dirs, so that concurrent jobs would build into
-/// it at once and test each other's mutants. `CARGO_TARGET_DIR` takes precedence over
-/// both. In place, there's only one build dir, which is the user's own tree, so their
-/// setting is kept.
-pub(crate) fn build_dir_cargo_env(
-    build_dir: &BuildDir,
+/// A switch that turns incremental on stays, because removing it would turn incremental
+/// off for a profile that says `incremental = false` (Measured 14).
+///
+/// `var` reads one variable, so that tests don't change the process environment.
+pub(crate) fn incremental_switches_to_remove(
     options: &Options,
-) -> Vec<(String, String)> {
-    let mut env = cargo_env(options);
+    var: impl Fn(&str) -> Option<String>,
+) -> Vec<String> {
+    if options.in_place {
+        return Vec::new();
+    }
+    INCREMENTAL_SWITCHES
+        .iter()
+        .filter(|(name, on)| var(name).is_some_and(|value| value != *on))
+        .map(|(name, _)| (*name).to_owned())
+        .collect()
+}
+
+/// Environment changes for cargo run in `build_dir`.
+///
+/// `set` holds those of [`cargo_env`], and `CARGO_TARGET_DIR` naming the build dir's own
+/// `target/`, unless mutants are tested in place. A target dir that the user sets in the
+/// environment or in cargo config would otherwise be shared by all the build dirs, so that
+/// concurrent jobs would build into it at once and test each other's mutants.
+/// `CARGO_TARGET_DIR` takes precedence over both.
+///
+/// `remove` holds the switches [`incremental_switches_to_remove`] names. A scratch build
+/// dir rebuilds the mutated package once per mutant, so a switch that a shell or a CI job
+/// sets to save disk would make every one of those builds start from nothing.
+///
+/// In place, there's only one build dir, which is the user's own tree, so their settings
+/// are kept.
+pub(crate) fn build_dir_cargo_env(build_dir: &BuildDir, options: &Options) -> Env {
+    let mut set = cargo_env(options);
     if !options.in_place {
         let target_dir = build_dir.path().join("target");
-        for name in ["CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"] {
-            if let Some(value) = env::var_os(name) {
-                debug!(
-                    %target_dir,
-                    "Overriding {name}={value:?} from the environment with the build dir's own target dir"
-                );
-            }
-        }
-        env.push(("CARGO_TARGET_DIR".to_owned(), target_dir.into_string()));
+        set.push(("CARGO_TARGET_DIR".to_owned(), target_dir.into_string()));
     }
-    env
+    Env {
+        set,
+        remove: incremental_switches_to_remove(options, |name| env::var(name).ok()),
+    }
 }
 
 /// Return the name of the cargo binary.
@@ -267,6 +290,7 @@ mod test {
         let build_dir = BuildDir::in_place(tmp.path().try_into().unwrap()).unwrap();
         let target_dir = |options: &Options| {
             build_dir_cargo_env(&build_dir, options)
+                .set
                 .into_iter()
                 .find(|(name, _)| name == "CARGO_TARGET_DIR")
                 .map(|(_, value)| value)
@@ -280,6 +304,46 @@ mod test {
             ..Options::default()
         };
         assert_eq!(target_dir(&in_place), None);
+    }
+
+    #[test]
+    fn incremental_switches_that_turn_incremental_off_are_removed_except_in_place() {
+        let off = |name: &str| match name {
+            "CARGO_INCREMENTAL" => Some("0".to_owned()),
+            "CARGO_BUILD_INCREMENTAL" => Some("false".to_owned()),
+            _ => None,
+        };
+        assert_eq!(
+            incremental_switches_to_remove(&Options::default(), off),
+            ["CARGO_INCREMENTAL", "CARGO_BUILD_INCREMENTAL"]
+        );
+        let in_place = Options {
+            in_place: true,
+            ..Options::default()
+        };
+        assert_eq!(
+            incremental_switches_to_remove(&in_place, off),
+            Vec::<String>::new()
+        );
+    }
+
+    /// A switch that turns incremental on stays: removing it would turn incremental off for a
+    /// profile that says `incremental = false`.
+    #[test]
+    fn incremental_switches_that_turn_incremental_on_or_are_unset_are_kept() {
+        let on = |name: &str| match name {
+            "CARGO_INCREMENTAL" => Some("1".to_owned()),
+            "CARGO_BUILD_INCREMENTAL" => Some("true".to_owned()),
+            _ => None,
+        };
+        assert_eq!(
+            incremental_switches_to_remove(&Options::default(), on),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            incremental_switches_to_remove(&Options::default(), |_| None),
+            Vec::<String>::new()
+        );
     }
 
     #[test]

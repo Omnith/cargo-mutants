@@ -5728,3 +5728,156 @@ fn cargo_target_dir_from_environment_is_not_used_by_schemata_build() {
         "nothing is built in the shared target dir"
     );
 }
+
+/// The rustc command lines in a log that compile `crate_name`.
+fn rustc_lines<'a>(log: &'a str, crate_name: &str) -> Vec<&'a str> {
+    let flag = format!("--crate-name {crate_name} ");
+    log.lines()
+        .filter(|line| line.contains("Running `") && line.contains(&flag))
+        .collect()
+}
+
+/// The text of every mutant's log in `mutants_out`: every log but the baseline's.
+fn mutant_logs(mutants_out: &Path) -> Vec<String> {
+    read_dir(mutants_out.join("log"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            !path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("baseline")
+        })
+        .map(|path| read_to_string(path).unwrap())
+        .collect()
+}
+
+/// With incremental compilation turned off in the environment, as a CI job or a shell
+/// might turn it off to save disk, each scratch build dir still builds incrementally:
+/// it rebuilds the mutated package once per mutant. With `-j2` the second build dir is
+/// seeded from the first, so the seeded copy is covered too.
+#[test]
+fn incremental_switches_from_environment_are_not_inherited_by_build_dirs() {
+    let tmp = copy_of_testdata("small_well_tested");
+    let out = tempdir().unwrap();
+    run()
+        .env("CARGO_INCREMENTAL", "0")
+        .env("CARGO_BUILD_INCREMENTAL", "false")
+        .args(["mutants", "--no-times", "--no-schemata", "-j2", "-d"])
+        .arg(tmp.path())
+        .arg("-o")
+        .arg(out.path())
+        .timeout(OUTER_TIMEOUT)
+        .assert()
+        .success();
+    let logs = mutant_logs(&out.path().join("mutants.out"));
+    assert!(logs.len() > 1, "{logs:?}");
+    for log in &logs {
+        let lines = rustc_lines(log, "cargo_mutants_testdata_small_well_tested");
+        assert!(!lines.is_empty(), "the mutant was built: {log}");
+        assert!(
+            lines.iter().all(|line| line.contains("-C incremental=")),
+            "{lines:?}"
+        );
+    }
+}
+
+#[test]
+fn incremental_switches_from_environment_are_not_inherited_by_schemata_build() {
+    let tmp = copy_of_testdata("small_well_tested");
+    let out = tempdir().unwrap();
+    run()
+        .env("CARGO_INCREMENTAL", "0")
+        .env("CARGO_BUILD_INCREMENTAL", "false")
+        .args(["mutants", "--no-times", "--schemata", "-d"])
+        .arg(tmp.path())
+        .arg("-o")
+        .arg(out.path())
+        .timeout(OUTER_TIMEOUT)
+        .assert()
+        .success();
+    let log = read_to_string(out.path().join("mutants.out/log/schemata-build-1.log")).unwrap();
+    let lines = rustc_lines(&log, "cargo_mutants_testdata_small_well_tested");
+    assert!(!lines.is_empty(), "the schema was built: {log}");
+    assert!(
+        lines.iter().all(|line| line.contains("-C incremental=")),
+        "{lines:?}"
+    );
+}
+
+/// Turning incremental compilation off for the profile, rather than for everything, is a
+/// decision about the build, so it holds in scratch build dirs too.
+#[test]
+fn incremental_off_in_the_profile_is_honoured_by_build_dirs() {
+    let tmp = copy_of_testdata("small_well_tested");
+    let out = tempdir().unwrap();
+    run()
+        .env("CARGO_INCREMENTAL", "0")
+        .env("CARGO_PROFILE_DEV_INCREMENTAL", "false")
+        .env("CARGO_PROFILE_TEST_INCREMENTAL", "false")
+        .args(["mutants", "--no-times", "--no-schemata", "-d"])
+        .arg(tmp.path())
+        .arg("-o")
+        .arg(out.path())
+        .timeout(OUTER_TIMEOUT)
+        .assert()
+        .success();
+    let logs = mutant_logs(&out.path().join("mutants.out"));
+    assert!(logs.len() > 1, "{logs:?}");
+    for log in &logs {
+        let lines = rustc_lines(log, "cargo_mutants_testdata_small_well_tested");
+        assert!(!lines.is_empty(), "the mutant was built: {log}");
+        assert!(
+            lines.iter().all(|line| !line.contains("-C incremental=")),
+            "{lines:?}"
+        );
+    }
+}
+
+/// The coverage build runs once per run, so incremental compilation gains it nothing and
+/// only adds a cache: it stays off there, while the schema's own build is incremental.
+#[test]
+fn coverage_build_is_not_incremental_in_test_selection_coverage_tree() {
+    if !llvm_tools_available("coverage_build_is_not_incremental_in_test_selection_coverage_tree") {
+        return;
+    }
+    let tmp = copy_of_testdata("test_selection_coverage");
+    let out = tempdir().unwrap();
+    run()
+        .env_remove("CARGO_INCREMENTAL")
+        .env_remove("CARGO_BUILD_INCREMENTAL")
+        .args([
+            "mutants",
+            "--no-times",
+            "--schemata",
+            "--test-selection=coverage",
+            "-d",
+        ])
+        .arg(tmp.path())
+        .arg("-o")
+        .arg(out.path())
+        .timeout(std::time::Duration::from_secs(600))
+        .assert()
+        .code(2); // Some mutants are missed.
+    let log = |name: &str| read_to_string(out.path().join("mutants.out/log").join(name)).unwrap();
+    let crate_name = "cargo_mutants_testdata_test_selection_coverage";
+    let schema_build = log("schemata-build-1.log");
+    let schema_lines = rustc_lines(&schema_build, crate_name);
+    assert!(!schema_lines.is_empty(), "{schema_build}");
+    assert!(
+        schema_lines
+            .iter()
+            .all(|line| line.contains("-C incremental=")),
+        "{schema_lines:?}"
+    );
+    let coverage_build = log("schemata-coverage-list.log");
+    let coverage_lines = rustc_lines(&coverage_build, crate_name);
+    assert!(!coverage_lines.is_empty(), "{coverage_build}");
+    assert!(
+        coverage_lines
+            .iter()
+            .all(|line| !line.contains("-C incremental=")),
+        "{coverage_lines:?}"
+    );
+}
