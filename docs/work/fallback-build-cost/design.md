@@ -346,16 +346,25 @@ A gate that checks its population against the outcomes then fails on the partial
 **What counts as the disk reporting full.** The text of a source line can hold the same words,
 so the check reads only what the toolchain says, never what it quotes:
 - A cargo JSON compiler message counts only through its `message` and its children's `message`
-  fields. Its `rendered` text and its spans quote source.
+  fields, each read line by line. Its `rendered` text and its spans quote source. A child can
+  hold the linker's whole output.
 - Another JSON line, such as an artifact notice, never counts.
 - A plain line loses its ANSI control sequences first, because cargo colors its output under
   `CARGO_TERM_COLOR=always` (Measured 14).
 - A plain line counts unless rustc is quoting source on it: a line that, trimmed of leading
-  space, starts with `|`, or with digits followed by ` |`, ` -`, ` +` or ` ~`.
-- The markers are `No space left on device` and `(os error 28)` (macOS and Linux, `ENOSPC`),
-  `There is not enough space on the disk` and `(os error 112)` (Windows, `ERROR_DISK_FULL`, whose
-  text is localized but whose code is not), and `errno=28` on a line that holds `ld:` (the macOS
-  linker).
+  space, starts with `|`, or with digits, one or more spaces, and one of `|`, `-`, `+` or `~`
+  followed by a space or the end of the line.
+- A line counts when it holds a marker of the platform cargo-mutants runs on. On macOS and
+  Linux the markers are `No space left on device` and `(os error 28)` (`ENOSPC`), and `errno=28`
+  on a line that also holds `ld:` (the macOS linker). On Windows they are
+  `There is not enough space on the disk` and `(os error 112)` (`ERROR_DISK_FULL`, whose text
+  is localized but whose code is not). The same rule applies to a plain line and to each line
+  of a JSON `message` field.
+- **This rule read every platform's markers on every platform, and the linker rule only on plain
+  lines. Both were wrong.** Linux's `(os error 112)` is `EHOSTDOWN`, measured in a debian
+  container, so a host that is down read as a full disk. With `--message-format=json`, which
+  the schema's build uses, rustc puts the linker's note in a child `message`, so a full disk at
+  link time made every embedded mutant fall back as an unattributed compile error.
 
 **One worker's disk-full error stops the others.** A worker that gets the error empties the
 shared queue before it returns, so every other worker finishes the mutant it holds and takes no

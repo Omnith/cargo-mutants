@@ -110,21 +110,35 @@ pub(crate) fn stop_if_disk_full(phase: Phase, text: &str, log_path: &Utf8Path) -
     Ok(())
 }
 
-/// Text in the operating system's message for a full disk.
-const DISK_FULL_MARKERS: [&str; 4] = [
-    // macOS and Linux: the text and the code of `ENOSPC`
-    "No space left on device",
-    "(os error 28)",
-    // windows: `ERROR_DISK_FULL`, whose text is localized and whose code is not
-    "There is not enough space on the disk",
-    "(os error 112)",
-];
+/// What a line says when the disk is full, on the platform cargo-mutants runs on. A line
+/// says so when it holds every part of one entry.
+///
+/// Each platform has its own: an error code names a full disk on one platform only.
+/// Linux's `(os error 112)` is `EHOSTDOWN`, and Windows' `(os error 28)` is
+/// `ERROR_OUT_OF_PAPER`.
+const DISK_FULL: &[&[&str]] = if cfg!(windows) {
+    // `ERROR_DISK_FULL`, whose text is localized and whose code is not
+    &[
+        &["There is not enough space on the disk"],
+        &["(os error 112)"],
+    ]
+} else if cfg!(unix) {
+    &[
+        // the text and the code of `ENOSPC`
+        &["No space left on device"],
+        &["(os error 28)"],
+        // the macOS linker gives only the error number
+        &["ld:", "errno=28"],
+    ]
+} else {
+    &[]
+};
 
 /// True if `text`, written by a failed cargo command, says the disk was full.
 ///
-/// rustc, the archiver and cargo itself print the operating system's message for the
-/// error: the same text on macOS and Linux, and another on Windows. Measured by filling a
-/// disk image: `docs/work/fallback-build-cost/design.md`, Measured 13.
+/// rustc, the archiver, the linker and cargo itself print the operating system's message
+/// for the error, which [`DISK_FULL`] holds for this platform. Measured by filling a disk
+/// image: `docs/work/fallback-build-cost/design.md`, Measured 13.
 pub(crate) fn ran_out_of_disk(text: &str) -> bool {
     text.lines().any(|line| {
         match line
@@ -141,6 +155,8 @@ pub(crate) fn ran_out_of_disk(text: &str) -> bool {
 /// True if a JSON line from cargo is a compiler message whose own text, or a child's,
 /// says the disk was full. Its `rendered` text and its spans quote source, so they are
 /// never read. Any other JSON line never counts.
+///
+/// A child can hold several lines: rustc puts the linker's whole output in one.
 fn compiler_message_ran_out_of_disk(value: &Value) -> bool {
     if value["reason"] != "compiler-message" {
         return false;
@@ -149,22 +165,22 @@ fn compiler_message_ran_out_of_disk(value: &Value) -> bool {
     once(diagnostic)
         .chain(diagnostic["children"].as_array().into_iter().flatten())
         .filter_map(|message| message["message"].as_str())
-        .any(holds_disk_full_marker)
+        .flat_map(str::lines)
+        .any(says_disk_full)
 }
 
 /// True if a line of plain output says the disk was full, and rustc is not quoting
 /// source on it.
 fn plain_line_ran_out_of_disk(line: &str) -> bool {
     let line = without_ansi_escapes(line);
-    if quotes_source(&line) {
-        return false;
-    }
-    // the macOS linker gives only the error number
-    holds_disk_full_marker(&line) || (line.contains("ld:") && line.contains("errno=28"))
+    !quotes_source(&line) && says_disk_full(&line)
 }
 
-fn holds_disk_full_marker(text: &str) -> bool {
-    DISK_FULL_MARKERS.iter().any(|marker| text.contains(marker))
+/// True if `line` holds every part of one entry of [`DISK_FULL`].
+fn says_disk_full(line: &str) -> bool {
+    DISK_FULL
+        .iter()
+        .any(|parts| parts.iter().all(|part| line.contains(part)))
 }
 
 /// True if rustc is quoting source on `line`: a gutter line that starts with `|`, or a
@@ -579,15 +595,38 @@ mod test {
     }
 
     #[test]
-    fn ran_out_of_disk_matches_each_platforms_message() {
+    #[cfg(unix)]
+    fn ran_out_of_disk_matches_enospc_by_its_text_or_its_code() {
         assert!(ran_out_of_disk(
             "error: could not write output to /t/deps/x.rcgu.o: No space left on device\n"
         ));
         assert!(ran_out_of_disk(
-            "error: No space left on device (os error 28) at path \"/t/check\"\n"
+            "error: failed to write /t/check (os error 28)\n"
+        ));
+    }
+
+    /// The text of `ERROR_DISK_FULL` is localized. Its code is not.
+    #[test]
+    #[cfg(windows)]
+    fn ran_out_of_disk_matches_error_disk_full_by_its_text_or_its_code() {
+        assert!(ran_out_of_disk(
+            "error: failed to write /t/x: There is not enough space on the disk.\n"
         ));
         assert!(ran_out_of_disk(
-            "error: failed to write /t/x: There is not enough space on the disk. (os error 112)\n"
+            "error: failed to write /t/x: Espace insuffisant sur le disque. (os error 112)\n"
+        ));
+    }
+
+    /// An error code names a full disk on one platform only.
+    #[test]
+    fn ran_out_of_disk_does_not_match_another_platforms_error_code() {
+        // linux `EHOSTDOWN`
+        #[cfg(unix)]
+        assert!(!ran_out_of_disk("error: Host is down (os error 112)\n"));
+        // windows `ERROR_OUT_OF_PAPER`
+        #[cfg(windows)]
+        assert!(!ran_out_of_disk(
+            "error: The printer is out of paper. (os error 28)\n"
         ));
     }
 
@@ -618,19 +657,58 @@ mod test {
         "#}));
     }
 
+    /// rustc quotes source only on a gutter line: a number, a space, then one of `|-+~`
+    /// followed by a space or the end of the line, or a bare `|`.
+    #[test]
+    fn quotes_source_only_on_rustc_gutter_lines() {
+        assert!(quotes_source("   |     ^^^^ expected `u8`"));
+        assert!(quotes_source("30 |     let x = 1;"));
+        assert!(quotes_source("4  -"));
+        // no space between the number and the bar
+        assert!(!quotes_source("4| x"));
+        // the symbol is not followed by a space
+        assert!(!quotes_source("4 -> x"));
+    }
+
     /// The macOS linker reports a full disk by its error number only.
     #[test]
-    fn ran_out_of_disk_matches_the_macos_linker() {
+    #[cfg(unix)]
+    fn ran_out_of_disk_matches_the_linker_only_for_errno_28() {
         assert!(ran_out_of_disk(indoc! {"
             error: linking with `cc` failed: exit status: 1
               = note: ld: ftruncate() failed, errno=28 for '/t/deps/x-1234'
         "}));
+        assert!(!ran_out_of_disk(indoc! {"
+            error: linking with `cc` failed: exit status: 1
+              = note: ld: library 'z' not found
+        "}));
+    }
+
+    /// With `--message-format=json`, rustc puts the linker's output in a child message.
+    #[test]
+    #[cfg(unix)]
+    fn ran_out_of_disk_matches_the_linker_in_a_json_compiler_message() {
+        let linker = json!({
+            "reason": "compiler-message",
+            "message": {
+                "level": "error",
+                "message": "linking with `cc` failed: exit status: 1",
+                "children": [
+                    {"level": "note", "message": "\"cc\" \"-arch\" \"arm64\" \"/t/deps/x.o\"", "children": [], "spans": [], "rendered": null},
+                    {"level": "note", "message": "ld: ftruncate() failed, errno=28 for '/t/deps/x-1234'\nclang: error: linker command failed with exit code 1", "children": [], "spans": [], "rendered": null},
+                ],
+                "spans": [],
+                "rendered": "error: linking with `cc` failed: exit status: 1\n",
+            },
+        });
+        assert!(ran_out_of_disk(&linker.to_string()));
     }
 
     /// With `--message-format=json`, which the schema's check and build use, a diagnostic is one
     /// line. Its own message counts. Its rendered text and spans quote source, so they don't.
     #[test]
     fn ran_out_of_disk_reads_only_the_messages_of_a_json_compiler_message() {
+        #[cfg(unix)]
         let full = json!({
             "reason": "compiler-message",
             "message": {
@@ -641,6 +719,7 @@ mod test {
                 "rendered": "error: could not write output to /t/deps/x.rcgu.o: No space left on device\n",
             },
         });
+        #[cfg(unix)]
         assert!(ran_out_of_disk(&full.to_string()));
         let quoted = json!({
             "reason": "compiler-message",
@@ -668,6 +747,7 @@ mod test {
         assert!(!ran_out_of_disk(
             "\x1b[1m\x1b[94m12\x1b[0m \x1b[1m\x1b[94m|\x1b[0m         let expected = \"No space left on device\";\n"
         ));
+        #[cfg(unix)]
         assert!(ran_out_of_disk(
             "\x1b[1m\x1b[91merror\x1b[0m\x1b[1m: No space left on device (os error 28)\x1b[0m\n"
         ));

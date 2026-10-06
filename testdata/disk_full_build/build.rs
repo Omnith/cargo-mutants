@@ -15,7 +15,12 @@ fn main() {
         .expect("read src/lib.rs")
         .replace("/* ~ changed by cargo-mutants ~ */ ", "");
     if source.contains("x + 2") {
-        eprintln!("error: No space left on device (os error 28)");
+        // cargo-mutants reads only the message of the platform it runs on
+        if cfg!(windows) {
+            eprintln!("error: There is not enough space on the disk. (os error 112)");
+        } else {
+            eprintln!("error: No space left on device (os error 28)");
+        }
         exit(1);
     }
 }
