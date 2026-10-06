@@ -1383,7 +1383,7 @@ git commit -m 'Record the fallback-build-cost acceptance runs' -- docs/work/fall
 
 ## Task 8: pull request, reviews, merge (Batch E)
 
-- [ ] **Step 1: push and open the pull request** against the fork, never upstream:
+- [x] **Step 1: push and open the pull request** against the fork, never upstream:
 
 ```
 git push -u omnith feat/fbc-1-incremental-scratch-dirs
@@ -1394,12 +1394,12 @@ The body follows jast-platform's pull request rules, which the orchestrator pass
 dispatch. One sentence on what it does, a table of what landed, a table of what was found, review
 focus as a list of paths.
 
-- [ ] **Step 2: reviews.** The orchestrator dispatches a code and architecture review and then an
+- [x] **Step 2: reviews.** The orchestrator dispatches a code and architecture review and then an
   adversarial review over the diff. Fold every CRITICAL, HIGH and MEDIUM finding on the same
   branch. Re-run the Task 6 gate after the folds.
 
-- [ ] **Step 3: merge** with `gh pr merge --repo Omnith/cargo-mutants --merge --delete-branch`.
-  Merge only when the checks that exist have all passed. Then update the main checkout:
+- [x] **Step 3: merge** with `gh pr merge --repo Omnith/cargo-mutants --merge --delete-branch`.
+  Merge only when the checks that exist have all passed. The fork had never run CI, so PR #1 had no checks. Kane chose to merge it on the local gates on 2026-10-05. Then update the main checkout:
   `git -C ~/repos/cargo-mutants pull omnith main`. Remove the worktree
   `~/repos/cargo-mutants-wt-fbc` and its target.
 
