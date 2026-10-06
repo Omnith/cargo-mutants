@@ -133,19 +133,45 @@ pub(crate) fn stop_if_disk_full<T: AsRef<str>>(
 ///
 /// Each platform has its own: an error code names a full disk on one platform only.
 /// Linux's `(os error 112)` is `EHOSTDOWN`, and Windows' `(os error 28)` is
-/// `ERROR_OUT_OF_PAPER`.
+/// `ERROR_OUT_OF_PAPER`. A quota exceeded counts as a full disk: the build could not
+/// write, so the mutant is not unviable.
 const DISK_FULL: &[&[&str]] = if cfg!(windows) {
-    // `ERROR_DISK_FULL`, whose text is localized and whose code is not
+    // texts from microsoft's "system error codes (0-499)". each text is localized and its
+    // code is not
     &[
+        // `ERROR_DISK_FULL`
         &["There is not enough space on the disk"],
         &["(os error 112)"],
+        // `ERROR_HANDLE_DISK_FULL`
+        &["The disk is full"],
+        &["(os error 39)"],
     ]
-} else if cfg!(unix) {
+} else if cfg!(target_os = "linux") {
+    &[
+        // the text and the code of `ENOSPC`
+        &["No space left on device"],
+        &["(os error 28)"],
+        &["ld:", "errno=28"],
+        // the text and the code of `EDQUOT`
+        &["Disk quota exceeded"],
+        &["(os error 122)"],
+    ]
+} else if cfg!(target_os = "macos") {
     &[
         // the text and the code of `ENOSPC`
         &["No space left on device"],
         &["(os error 28)"],
         // the macOS linker gives only the error number
+        &["ld:", "errno=28"],
+        // the text and the code of `EDQUOT`. "disc" is apple's spelling
+        &["Disc quota exceeded"],
+        &["(os error 69)"],
+    ]
+} else if cfg!(unix) {
+    // `ENOSPC` only: other unix systems number `EDQUOT` their own way, and none was measured
+    &[
+        &["No space left on device"],
+        &["(os error 28)"],
         &["ld:", "errno=28"],
     ]
 } else {
@@ -662,6 +688,31 @@ mod test {
         );
     }
 
+    /// `ERROR_HANDLE_DISK_FULL` is a full disk too. Its text is localized and its code is not.
+    #[test]
+    #[cfg(windows)]
+    fn ran_out_of_disk_matches_error_handle_disk_full_by_its_text_or_its_code() {
+        assert!(ran_out_of_disk("error: failed to write /t/x: The disk is full.\n").is_some());
+        assert!(
+            ran_out_of_disk("error: failed to write /t/x: Le disque est plein. (os error 39)\n")
+                .is_some()
+        );
+    }
+
+    /// A quota exceeded is a full disk too: the build could not write. `EDQUOT` is 122 on
+    /// Linux and 69 on macOS, and each spells its text its own way.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn ran_out_of_disk_matches_edquot_by_its_text_or_its_code() {
+        let (text, code) = if cfg!(target_os = "linux") {
+            ("Disk quota exceeded", "(os error 122)")
+        } else {
+            ("Disc quota exceeded", "(os error 69)")
+        };
+        assert!(ran_out_of_disk(&format!("error: failed to write /t/x: {text}\n")).is_some());
+        assert!(ran_out_of_disk(&format!("error: failed to write /t/x {code}\n")).is_some());
+    }
+
     /// An error code names a full disk on one platform only.
     #[test]
     fn ran_out_of_disk_does_not_match_another_platforms_error_code() {
@@ -677,6 +728,30 @@ mod test {
             ran_out_of_disk("error: The printer is out of paper. (os error 28)\n"),
             None
         );
+        // macos `EDQUOT` is linux `ESRMOUNT`. windows `ERROR_HANDLE_DISK_FULL` is linux `ENOTEMPTY`
+        #[cfg(target_os = "linux")]
+        for other in [
+            "Srmount error (os error 69)",
+            "Directory not empty (os error 39)",
+        ] {
+            assert_eq!(ran_out_of_disk(other), None, "{other}");
+        }
+        // linux `EDQUOT` is no macos error. windows `ERROR_HANDLE_DISK_FULL` is macos `EDESTADDRREQ`
+        #[cfg(target_os = "macos")]
+        for other in [
+            "Unknown error: 122 (os error 122)",
+            "Destination address required (os error 39)",
+        ] {
+            assert_eq!(ran_out_of_disk(other), None, "{other}");
+        }
+        // macos `EDQUOT` is `ERROR_TOO_MANY_SESS`, and linux `EDQUOT` is `ERROR_INSUFFICIENT_BUFFER`
+        #[cfg(windows)]
+        for other in [
+            "The network BIOS session limit was exceeded. (os error 69)",
+            "The data area passed to a system call is too small. (os error 122)",
+        ] {
+            assert_eq!(ran_out_of_disk(other), None, "{other}");
+        }
     }
 
     #[test]

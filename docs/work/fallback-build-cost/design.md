@@ -247,6 +247,8 @@ rustc's object write, its archive step and cargo itself each print `No space lef
 That is the `strerror` text for `ENOSPC` on macOS and Linux. Windows prints `There is not enough
 space on the disk. (os error 112)` for `ERROR_DISK_FULL`. Both reach a classic mutant's log, and
 `outcome.rs:278` reports the mutant `Unviable` because its build failed.
+A quota exceeded and Windows' `ERROR_HANDLE_DISK_FULL` say the same in other words
+(Measured 16).
 
 **14. Where the first disk-full check went wrong.** Found by the plan's adversarial review,
 2026-10-05, on a scratch build of this plan's detector, and on a filled 60 MB disk image:
@@ -291,6 +293,34 @@ warning: p3@0.1.0: error: could not write /t/x.o: No space left on device
 - With `--message-format=json` the same plain lines go to stderr.
 - A build script that fails also prints its output raw, under `--- stdout`:
   `  cargo:warning=    3 |     const char ...`. The prefix rule does not reach that line.
+
+**16. Other errors that mean the build could not write.** Found by the pull request's adversarial
+review, 2026-10-05: the markers knew `ENOSPC` and `ERROR_DISK_FULL` only. Measured the same day.
+On this Mac, Darwin 24.6.0:
+
+```
+$ python3 -c 'import os; print(repr(os.strerror(69))); print(repr(os.strerror(122)))'
+'Disc quota exceeded'
+'Unknown error: 122'
+```
+
+In `debian:bookworm-slim`, and Rust's `io::Error::from_raw_os_error` in `rust:1-bookworm`:
+
+```
+$ perl -e 'for (122, 69, 28, 39) { $! = $_; print "$_: $!\n" }'
+122: Disk quota exceeded
+69: Srmount error
+28: No space left on device
+39: Directory not empty
+Disk quota exceeded (os error 122)
+Srmount error (os error 69)
+```
+
+The same Rust program on the Mac printed `Disc quota exceeded (os error 69)` and
+`Destination address required (os error 39)`. Microsoft's "System Error Codes (0-499)" gives
+`ERROR_HANDLE_DISK_FULL` as 39 (0x27), "The disk is full." It gives 69 as
+`ERROR_TOO_MANY_SESS` and 122 as `ERROR_INSUFFICIENT_BUFFER`. So 69, 122 and 39 each name a
+full disk on one platform and something else on another.
 
 Re-derive Measured 1 and 2: read the named key from `mutants.out/schemata.json`, or sum
 `phase_results[].duration` by phase in `outcomes.json` for the mutants named in
@@ -378,12 +408,17 @@ so the check reads only what the toolchain says, never what it quotes:
 - A plain line counts unless rustc is quoting source on it: a line that, trimmed of leading
   space, starts with `|`, or with digits, one or more spaces, and one of `|`, `-`, `+` or `~`
   followed by a space or the end of the line.
-- A line counts when it holds a marker of the platform cargo-mutants runs on. On macOS and
-  Linux the markers are `No space left on device` and `(os error 28)` (`ENOSPC`), and `errno=28`
-  on a line that also holds `ld:` (the macOS linker). On Windows they are
-  `There is not enough space on the disk` and `(os error 112)` (`ERROR_DISK_FULL`, whose text
-  is localized but whose code is not). The same rule applies to a plain line and to each line
-  of a JSON `message` field.
+- A line counts when it holds a marker of the platform cargo-mutants runs on. On every unix
+  system the markers are `No space left on device` and `(os error 28)` (`ENOSPC`), and `errno=28`
+  on a line that also holds `ld:` (the macOS linker). A quota exceeded counts too, because the
+  build could not write and the mutant is not unviable. Linux adds `Disk quota exceeded` and
+  `(os error 122)` (`EDQUOT`). macOS adds `Disc quota exceeded`, Apple's spelling, and
+  `(os error 69)` (`EDQUOT`). Other unix systems number `EDQUOT` their own way, and none was
+  measured, so they keep `ENOSPC` only. On Windows the markers are
+  `There is not enough space on the disk` and `(os error 112)` (`ERROR_DISK_FULL`), and
+  `The disk is full` and `(os error 39)` (`ERROR_HANDLE_DISK_FULL`). Each Windows text is
+  localized and its code is not (Measured 16). The same rule applies to a plain line and to each
+  line of a JSON `message` field.
 - **This rule read every platform's markers on every platform, and the linker rule only on plain
   lines. Both were wrong.** Linux's `(os error 112)` is `EHOSTDOWN`, measured in a debian
   container, so a host that is down read as a full disk. With `--message-format=json`, which
