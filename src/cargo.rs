@@ -5,12 +5,13 @@
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
+use std::collections::BTreeMap;
 use std::env;
 use std::iter::once;
 use std::time::{Duration, Instant};
 
 use nextest_metadata::NextestExitCode;
-use tracing::{debug, debug_span, warn};
+use tracing::{debug, debug_span, info, warn};
 
 use crate::Result;
 use crate::build_dir::BuildDir;
@@ -120,6 +121,72 @@ pub(crate) fn incremental_switches_to_remove(
         .filter(|(name, on)| var(name).is_some_and(|value| value != *on))
         .map(|(name, _)| (*name).to_owned())
         .collect()
+}
+
+/// Variables that a scratch build dir overrides with its own value.
+const OVERRIDDEN_IN_BUILD_DIRS: [&str; 2] = ["CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"];
+
+/// What a run in scratch build dirs takes from cargo-mutants' environment and changes:
+/// each variable that was set, with the value it had.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct EnvOverrides {
+    /// Set, and replaced by the build dir's own value.
+    pub overridden: BTreeMap<String, String>,
+    /// Set, and removed, so that cargo config and the profile decide.
+    pub removed: BTreeMap<String, String>,
+}
+
+/// The variables in `var` that scratch build dirs override or remove; none in place.
+///
+/// `var` reads one variable, so that tests don't change the process environment.
+pub(crate) fn env_overrides(
+    options: &Options,
+    var: impl Fn(&str) -> Option<String>,
+) -> EnvOverrides {
+    if options.in_place {
+        return EnvOverrides::default();
+    }
+    let with_value = |name: &str| var(name).map(|value| (name.to_owned(), value));
+    EnvOverrides {
+        overridden: OVERRIDDEN_IN_BUILD_DIRS
+            .iter()
+            .filter_map(|name| with_value(name))
+            .collect(),
+        // the same decision as the removal itself, so the report and the removal agree
+        removed: incremental_switches_to_remove(options, &var)
+            .iter()
+            .filter_map(|name| with_value(name))
+            .collect(),
+    }
+}
+
+/// Report, once per run, what the build dirs change in cargo-mutants' environment.
+///
+/// `build_dir_cargo_env` runs for every process, including every replayed test, so it
+/// reports nothing itself.
+pub(crate) fn report_env_overrides(overrides: &EnvOverrides) {
+    if overrides.overridden.is_empty() && overrides.removed.is_empty() {
+        return;
+    }
+    debug!(
+        overridden = ?overrides.overridden,
+        removed = ?overrides.removed,
+        "build_dirs.env_overrides"
+    );
+    if !overrides.removed.is_empty() {
+        let removed = overrides
+            .removed
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join(" and ");
+        info!(
+            "Removed {removed} in scratch build dirs, so cargo config and the profile decide \
+            incremental compilation there. To keep it off, set `incremental = false` in the \
+            profile, CARGO_PROFILE_<NAME>_INCREMENTAL=false, or `build.incremental = false` \
+            in cargo config"
+        );
+    }
 }
 
 /// Environment changes for cargo run in `build_dir`.
@@ -343,6 +410,39 @@ mod test {
         assert_eq!(
             incremental_switches_to_remove(&Options::default(), |_| None),
             Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn env_overrides_names_each_variable_a_scratch_build_dir_overrides_or_removes() {
+        let vars = [("CARGO_TARGET_DIR", "/shared"), ("CARGO_INCREMENTAL", "0")];
+        let var = |name: &str| {
+            vars.iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, value)| (*value).to_owned())
+        };
+        let overrides = env_overrides(&Options::default(), var);
+        assert_eq!(
+            overrides.overridden,
+            BTreeMap::from([("CARGO_TARGET_DIR".to_owned(), "/shared".to_owned())])
+        );
+        assert_eq!(
+            overrides.removed,
+            BTreeMap::from([("CARGO_INCREMENTAL".to_owned(), "0".to_owned())])
+        );
+    }
+
+    #[test]
+    fn env_overrides_is_empty_in_place_or_when_nothing_is_set() {
+        let set = |name: &str| Some(format!("value of {name}"));
+        let in_place = Options {
+            in_place: true,
+            ..Options::default()
+        };
+        assert_eq!(env_overrides(&in_place, set), EnvOverrides::default());
+        assert_eq!(
+            env_overrides(&Options::default(), |_| None),
+            EnvOverrides::default()
         );
     }
 

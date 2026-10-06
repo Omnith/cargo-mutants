@@ -21,6 +21,10 @@ pub fn run() -> assert_cmd::Command {
     //
     // Also strip GITHUB_ACTION to avoid automatically emitting github annotations,
     // so that tests are more hermetic and reproducible between local and CI.
+    //
+    // Also strip CARGO_INCREMENTAL and CARGO_BUILD_INCREMENTAL, which cargo-mutants
+    // reports on the console when it removes them in build dirs. Tests about them set
+    // them explicitly.
     env::vars()
         .map(|(k, _v)| k)
         .filter(|k| {
@@ -29,6 +33,8 @@ pub fn run() -> assert_cmd::Command {
                 || k == "NOCOLOR"
                 || k == "CARGO_TERM_COLOR"
                 || k == "GITHUB_ACTION"
+                || k == "CARGO_INCREMENTAL"
+                || k == "CARGO_BUILD_INCREMENTAL"
         })
         .for_each(|k| {
             cmd.env_remove(k);

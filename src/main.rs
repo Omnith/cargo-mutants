@@ -65,6 +65,7 @@ use tracing::{debug, error, info};
 
 use crate::{
     build_dir::BuildDir,
+    cargo::{env_overrides, report_env_overrides},
     console::Console,
     exit_code::ExitCode,
     in_diff::diff_filter_file,
@@ -688,6 +689,7 @@ fn main() -> Result<ExitCode> {
             output_dir.write_previously_caught(&previously_caught)?;
         }
         console.set_debug_log(output_dir.open_debug_log()?);
+        report_env_overrides(&env_overrides(&options, |name| env::var(name).ok()));
         let lab_outcome = if use_schemata {
             schemata::test_mutants(mutants, &workspace, output_dir, &options, &console)?
         } else {

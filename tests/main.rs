@@ -5787,7 +5787,7 @@ fn incremental_switches_from_environment_are_not_inherited_by_build_dirs() {
 fn incremental_switches_from_environment_are_not_inherited_by_schemata_build() {
     let tmp = copy_of_testdata("small_well_tested");
     let out = tempdir().unwrap();
-    run()
+    let assert = run()
         .env("CARGO_INCREMENTAL", "0")
         .env("CARGO_BUILD_INCREMENTAL", "false")
         .args(["mutants", "--no-times", "--schemata", "-d"])
@@ -5804,6 +5804,17 @@ fn incremental_switches_from_environment_are_not_inherited_by_schemata_build() {
         lines.iter().all(|line| line.contains("-C incremental=")),
         "{lines:?}"
     );
+    let report: serde_json::Value = read_to_string(out.path().join("mutants.out/schemata.json"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        report["removed_env"],
+        json!({"CARGO_BUILD_INCREMENTAL": "false", "CARGO_INCREMENTAL": "0"})
+    );
+    let output = String::from_utf8_lossy(&assert.get_output().stdout).into_owned()
+        + &String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(output.contains("CARGO_INCREMENTAL=0"), "{output}");
 }
 
 /// Turning incremental compilation off for the profile, rather than for everything, is a
