@@ -152,15 +152,23 @@ fn type_replacements(type_: &Type, error_exprs: &[Expr]) -> impl Iterator<Item =
                 // Something like `T<A>` or `T<'a, A>`, when we don't know exactly how
                 // to call it, but we strongly suspect that you could construct it from
                 // an `A`.
-                iter::once(quote! { #collection_type::new() })
-                    .chain(type_replacements(inner_type, error_exprs).flat_map(|rep| {
-                        [
-                            quote! { #collection_type::from_iter([#rep]) },
-                            quote! { #collection_type::new(#rep) },
-                            quote! { #collection_type::from(#rep) },
-                        ]
-                    }))
-                    .collect_vec()
+                //
+                // Many such types have no `new` and no `FromIterator` but do implement
+                // `Default`. iced's `Task<T>` is one. Without `Default::default()` every
+                // guess fails to build, so no whole-body replacement is ever measured.
+                [
+                    quote! { #collection_type::new() },
+                    quote! { Default::default() },
+                ]
+                .into_iter()
+                .chain(type_replacements(inner_type, error_exprs).flat_map(|rep| {
+                    [
+                        quote! { #collection_type::from_iter([#rep]) },
+                        quote! { #collection_type::new(#rep) },
+                        quote! { #collection_type::from(#rep) },
+                    ]
+                }))
+                .collect_vec()
             } else {
                 trace!(
                     type_ = type_.to_pretty_string(),
@@ -785,6 +793,7 @@ mod test {
             &[],
             &[
                 "UnknownContainer::new()",
+                "Default::default()",
                 r#"UnknownContainer::from_iter([""])"#,
                 r#"UnknownContainer::new("")"#,
                 r#"UnknownContainer::from("")"#,

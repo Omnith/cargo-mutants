@@ -59,6 +59,7 @@ More mutation genres and patterns will be added in future releases.
 | `HttpResponse`    | `HttpResponse::Ok().finish`                                |
 | `(A, B, ...)`     | `(a, b, ...)` for the product of all replacements of A, B, ... |
 | `impl Iterator`   | Empty and one-element iterators of the inner type           |
+| other `T<A>`      | `T::new()`, `Default::default()`, and `T::from_iter([...])`, `T::new(...)`, `T::from(...)` |
 | (any other)       | `Default::default()`                                       |
 
 `...` in the mutation patterns indicates that the type is recursively mutated.
