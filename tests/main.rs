@@ -4388,8 +4388,16 @@ fn schemata_stop_after_build_in_schemata_tree_reports_errors_blamed_for_drops_wi
 fn schemata_fallback_in_schemata_tree_uses_seed_target_and_logs_timing() {
     let tmp = copy_of_testdata("schemata");
     // `double` is a const fn, so its mutants fall back; `weighted_sum`'s are embedded.
+    // `auto` test selection collects coverage when the baseline's timings say it pays, and
+    // that seeds a second build dir, so the count below would depend on the machine's load.
     let output = run()
-        .args(["mutants", "--schemata", "--no-times", "-j2"])
+        .args([
+            "mutants",
+            "--schemata",
+            "--no-times",
+            "-j2",
+            "--test-selection=all",
+        ])
         .args(["--re", "double|weighted_sum", "-d"])
         .arg(tmp.path())
         .timeout(OUTER_TIMEOUT)
